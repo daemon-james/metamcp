@@ -48,9 +48,13 @@ COPY . .
 # Build all packages and apps
 RUN pnpm build
 
-RUN sed -i -e "s/30000/600000/" \
-    "node_modules/.pnpm/next@15.5.12_react-dom@19.1.2_react@19.1.2__react@19.1.2/node_modules/next/dist/server/lib/router-utils/proxy-request.js" \
-    "node_modules/.pnpm/next@15.5.12_react-dom@19.1.2_react@19.1.2__react@19.1.2/node_modules/next/dist/esm/server/lib/router-utils/proxy-request.js"
+# Raise Next's dev-proxy timeout. The upstream Dockerfile hardcodes one pnpm
+# store path (next@15.5.12_react-dom@19.1.2_react@19.1.2__react@19.1.2); that
+# directory name changes whenever the lockfile resolves differently, and the
+# build then dies on `sed: can't read`. Locate the files instead.
+RUN find node_modules/.pnpm -path "*/next/dist/*/router-utils/proxy-request.js" \
+    -exec sed -i -e "s/30000/600000/" {} + \
+    && echo "patched $(find node_modules/.pnpm -path '*/next/dist/*/router-utils/proxy-request.js' | wc -l) proxy-request.js file(s)"
 
 # Production runner stage
 FROM base AS runner
@@ -86,11 +90,24 @@ COPY --from=builder --chown=nextjs:nodejs /app/node_modules ./node_modules
 COPY --from=builder --chown=nextjs:nodejs /app/package.json ./
 COPY --from=builder --chown=nextjs:nodejs /app/pnpm-workspace.yaml ./
 
-# Install production dependencies only
-RUN pnpm install --prod
+# Install production dependencies only.
+# CI=true because pnpm refuses to remove an existing modules dir without a TTY
+# (ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY). Upstream only ever builds this
+# in GitHub Actions, where CI is already set, so it isn't in the Dockerfile.
+RUN CI=true pnpm install --prod
 
 # Install drizzle-kit locally in backend for migrations
-RUN cd apps/backend && pnpm add drizzle-kit@0.31.1
+# The entrypoint runs `pnpm exec drizzle-kit migrate` from apps/backend, so the
+# binary has to be linked into apps/backend/node_modules/.bin.
+# A plain `pnpm add` aborts here with ERR_PNPM_INCLUDED_DEPS_CONFLICT because
+# /app was installed --prod above, and `pnpm add --prod` on its own just updates
+# the existing devDependencies entry and then prunes it again — the package ends
+# up in the store with no bin link. Dropping the dev entry first makes --prod
+# write it to dependencies, where it survives.
+RUN cd apps/backend \
+    && node -e "const fs=require('fs');const p=JSON.parse(fs.readFileSync('package.json','utf8'));delete p.devDependencies['drizzle-kit'];fs.writeFileSync('package.json',JSON.stringify(p,null,2))" \
+    && CI=true pnpm add --prod drizzle-kit@0.31.1 \
+    && test -x node_modules/.bin/drizzle-kit
 
 # Copy startup script
 COPY --chown=nextjs:nodejs docker-entrypoint.sh ./

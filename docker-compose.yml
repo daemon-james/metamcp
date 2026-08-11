@@ -1,8 +1,18 @@
 services:
   app:
     container_name: metamcp
-    image: ghcr.io/metatool-ai/metamcp:latest
-    pull_policy: always
+    # Local build (docker build -t metamcp:oauth-refresh .). Carries fixes that
+    # are not upstream:
+    #   - mcp-proxy/server.ts: the SseError-only 401 check missed
+    #     STREAMABLE_HTTP, so OAuth-protected servers (sentry) could never
+    #     complete the browser auth flow.
+    #   - token-exchange.ts: SDK 1.29 carries the HTTP status on the error's
+    #     `code`, not in its message, so an expired token was never classified
+    #     as an auth failure and refresh-on-401 never ran.
+    #   - client.ts: reload OAuth tokens from the DB on every connect (the pool
+    #     cached a snapshot), and flag error_status when a remote server
+    #     exhausts its connection attempts.
+    image: metamcp:oauth-refresh
     env_file:
       - .env
     ports:
@@ -27,6 +37,19 @@ services:
       
       # Docker networking fix
       TRANSFORM_LOCALHOST_TO_DOCKER_INTERNAL: ${TRANSFORM_LOCALHOST_TO_DOCKER_INTERNAL:-true}
+
+      # Idle-session reaper. McpServerPool.cleanupExpiredSessions() runs every 5
+      # minutes but returns early when getSessionLifetime() is null, which is the
+      # default when neither this env var nor a SESSION_LIFETIME config row is set.
+      # With it unset, a client that disconnects uncleanly leaves its active
+      # session — and therefore a full set of backend stdio processes — pinned
+      # forever; only maxConnectionsPerServer stops it growing without bound.
+      #
+      # This is an IDLE timeout, not a hard TTL: getSession() touches the session
+      # timestamp on every access, so a session in active use never expires. A
+      # session that is reaped recovers transparently — getSession() re-initialises
+      # an unknown sessionId from the idle pool on the next call.
+      SESSION_LIFETIME: ${SESSION_LIFETIME:-1800000} # 30 minutes, in milliseconds
       
       # ========================================================================
       # Bootstrap Configuration Examples
@@ -161,7 +184,7 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-    restart: "no"
+    restart: unless-stopped
     volumes:
       # Persist the uv cache across container recreates. Without this, every
       # `docker compose up -d`/recreate wipes the writable layer and the next
@@ -170,6 +193,24 @@ services:
       # in error_status=ERROR. The image ships /home/nextjs/.cache/uv owned by
       # nextjs (uid 1001) so a fresh named volume inherits correct ownership.
       - uv_cache:/home/nextjs/.cache/uv
+      # Same reasoning for npx: without this, every recreate re-downloads each
+      # `npx -y <pkg>` server, and several racing cold installs against a fresh
+      # _npx dir corrupt each other (TAR_ENTRY_ERROR / spawn ENOENT).
+      - npm_cache:/home/nextjs/.npm
+      # STDIO servers are spawned inside this container, so the host paths in
+      # their commands have to resolve here too. Read-only, and scoped to the
+      # directories that actually hold MCP server code — not all of $HOME.
+      - /home/dev/.local/bin:/home/dev/.local/bin:ro
+      - /home/dev/.local/share/mcp-servers:/home/dev/.local/share/mcp-servers:ro
+      - /home/dev/.local/share/uv:/home/dev/.local/share/uv:ro
+      - /home/dev/projects/dokploy-mcp-server:/home/dev/projects/dokploy-mcp-server:ro
+      - /home/dev/projects/unifi-network-mcp:/home/dev/projects/unifi-network-mcp:ro
+      # claude-design's launcher reads Claude Code's OAuth token from
+      # $HOME/.claude/.credentials.json. Mounted at the container user's home so
+      # node's homedir() resolves without overriding HOME (which would move the
+      # npm cache off its volume). Host-side access is a POSIX ACL for uid 1001
+      # only — the file stays 0600, no chmod.
+      - /home/dev/.claude:/home/nextjs/.claude:ro
     networks:
       - metamcp-network
 
@@ -198,6 +239,8 @@ services:
 
 volumes:
   postgres_data:
+    driver: local
+  npm_cache:
     driver: local
   uv_cache:
     driver: local
