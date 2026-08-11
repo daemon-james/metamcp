@@ -1,11 +1,16 @@
+import { registerClient } from "@modelcontextprotocol/sdk/client/auth.js";
 import { OAuthClientInformation } from "@modelcontextprotocol/sdk/shared/auth.js";
 import {
   ExchangeOAuthTokenRequestSchema,
   ExchangeOAuthTokenResponseSchema,
   GetOAuthSessionRequestSchema,
   GetOAuthSessionResponseSchema,
+  McpServerErrorStatusEnum,
+  OAuthClientInformationSchema,
   RefreshOAuthTokenRequestSchema,
   RefreshOAuthTokenResponseSchema,
+  RegisterOAuthClientRequestSchema,
+  RegisterOAuthClientResponseSchema,
   UpsertOAuthSessionRequestSchema,
   UpsertOAuthSessionResponseSchema,
 } from "@repo/zod-types";
@@ -363,6 +368,31 @@ export const oauthImplementations = {
       );
     }
 
+    // Fresh credentials are exactly the recovery an ERROR-flagged server was
+    // waiting for. Clear the flag so the pool's 60s health check picks the
+    // server back up — `connectMetaMcpClient` reloads tokens from the database
+    // on connect, so it will use these. Without this the server would stay
+    // flagged, stay out of the namespace pool, and never be re-dialled, making
+    // a successful re-authorisation look like it did nothing.
+    //
+    // Writing through the repository rather than `serverErrorTracker` keeps
+    // this module off `config.service`'s import chain (which opens the DB at
+    // import time). The tracker's other job — the in-memory crash counter —
+    // is STDIO-only and irrelevant to an OAuth server.
+    try {
+      await mcpServersRepository.updateServerErrorStatus({
+        serverUuid: input.mcp_server_uuid,
+        errorStatus: McpServerErrorStatusEnum.enum.NONE,
+      });
+    } catch (resetError) {
+      logger.warn(
+        `[oauth] failed to clear error status after successful exchange ` +
+          `— server=${input.mcp_server_uuid}: ${
+            resetError instanceof Error ? resetError.message : "unknown"
+          }`,
+      );
+    }
+
     logger.info(
       `[oauth] token exchange succeeded — server=${input.mcp_server_uuid} ` +
         `access_token=${redactToken(tokens.access_token)} ` +
@@ -432,6 +462,61 @@ export const oauthImplementations = {
           error_description: result.errorDescription,
           upstream_status: result.upstreamStatus,
         };
+    }
+  },
+  // Dynamic client registration, run server-side.
+  //
+  // The browser cannot do this itself: providers such as Sentry answer the
+  // CORS preflight on /oauth/register with 204 and no
+  // Access-Control-Allow-Origin, so the fetch is blocked before it is sent.
+  // The SDK's auth() then throws, useConnection's handleAuthError propagates
+  // it, and the UI shows "Connection Error" with no redirect — the Connect
+  // button appears to do nothing. Same rationale as exchangeToken below.
+  //
+  // The upstream URL comes from the mcp_servers row (never the request) via
+  // resolveOwnedServerUrl, which also enforces ownership — otherwise this
+  // would be an SSRF primitive.
+  register: async (
+    input: z.infer<typeof RegisterOAuthClientRequestSchema>,
+    userId: string,
+  ): Promise<z.infer<typeof RegisterOAuthClientResponseSchema>> => {
+    const serverResolution = await resolveOwnedServerUrl(
+      input.mcp_server_uuid,
+      userId,
+    );
+    if (!serverResolution.ok) {
+      return { success: false as const, ...serverResolution.error };
+    }
+    const serverUrl = serverResolution.url;
+
+    try {
+      const metadata = await discoverAuthorizationServerMetadata(serverUrl);
+      if (!metadata) {
+        return {
+          success: false as const,
+          error: "discovery_failed",
+          error_description: `No authorization server metadata at ${serverUrl}`,
+        };
+      }
+      const clientInformation = await registerClient(serverUrl, {
+        metadata: metadata as never,
+        clientMetadata: input.client_metadata as never,
+      });
+
+      const parsed = OAuthClientInformationSchema.parse(clientInformation);
+      await oauthSessionsRepository.upsert({
+        mcp_server_uuid: input.mcp_server_uuid,
+        client_information: parsed,
+      });
+
+      return { success: true as const, data: parsed };
+    } catch (error) {
+      return {
+        success: false as const,
+        error: "registration_failed",
+        error_description:
+          error instanceof Error ? error.message : String(error),
+      };
     }
   },
 };

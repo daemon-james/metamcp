@@ -109,6 +109,31 @@ class DbOAuthClientProvider implements OAuthClientProvider {
         }
       }
 
+      // Nothing registered yet. Returning undefined here makes the SDK attempt
+      // dynamic client registration from the browser, which many providers
+      // block: Sentry answers the CORS preflight on /oauth/register with 204
+      // and no Access-Control-Allow-Origin, so auth() throws before it ever
+      // redirects and the Connect button silently does nothing. Register on
+      // the backend instead — same reason the token exchange lives there.
+      if (exists) {
+        const registration =
+          await vanillaTrpcClient.frontend.oauth.register.mutate({
+            mcp_server_uuid: this.mcpServerUuid,
+            client_metadata: this
+              .clientMetadata as unknown as Record<string, unknown>,
+          });
+        if (registration.success) {
+          return await OAuthClientInformationSchema.parseAsync(
+            registration.data,
+          );
+        }
+        console.error(
+          "Server-side client registration failed:",
+          registration.error,
+          registration.error_description,
+        );
+      }
+
       return undefined;
     } catch (error) {
       console.error("Error retrieving client information:", error);

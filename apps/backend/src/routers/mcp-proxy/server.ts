@@ -24,6 +24,25 @@ import { resolveEnvVariables } from "../../lib/metamcp/utils";
 import { ProcessManagedStdioTransport } from "../../lib/stdio-transport/process-managed-transport";
 import { betterAuthMcpMiddleware } from "../../middleware/better-auth-mcp.middleware";
 
+/**
+ * Only SseError carries a `code`, so the original
+ * `error instanceof SseError && error.code === 401` check silently missed every
+ * OAuth-protected STREAMABLE_HTTP server: that transport rejects with a plain
+ * Error ("Error POSTing to endpoint (HTTP 401): ..."). The 401 fell through to a
+ * 500, the frontend's is401Error never matched, and the OAuth redirect was never
+ * triggered — so the Connect button looked dead.
+ */
+const isUnauthorizedError = (error: unknown): error is Error => {
+  // Narrowing to Error first keeps the type predicate honest — every
+  // transport rejection the SDK produces (SseError, StreamableHTTPError,
+  // plain Error) is an Error subclass, and callers below read `.message`.
+  if (!(error instanceof Error)) return false;
+  if (error instanceof SseError) return error.code === 401;
+  const withStatus = error as Error & { code?: unknown; status?: unknown };
+  if (withStatus.code === 401 || withStatus.status === 401) return true;
+  return /\(HTTP 401\)|\b401\b|Unauthorized/i.test(error.message);
+};
+
 const SSE_HEADERS_PASSTHROUGH = ["authorization"];
 const STREAMABLE_HTTP_HEADERS_PASSTHROUGH = [
   "authorization",
@@ -352,6 +371,27 @@ const createTransport = async (req: express.Request): Promise<Transport> => {
       ...getHttpHeaders(req, transportType),
     };
 
+    // StreamableHTTPClientTransport.start() is lazy — it issues no request — so
+    // an OAuth-protected server's 401 would otherwise only surface later, in
+    // band, as a JSON-RPC -32001 that the route can no longer turn into an HTTP
+    // 401. (SSE never had this problem: its start() opens the stream and throws
+    // SseError immediately, which is why only SSE servers could be authorized.)
+    // Probe with a deliberately empty body: an unauthorized server answers 401
+    // before parsing, an authorized one answers 4xx about the body, and neither
+    // leaves a stray MCP session behind.
+    const probe = await fetch(url, {
+      method: "POST",
+      headers: { ...headers, "Content-Type": "application/json" },
+      body: "{}",
+    });
+    if (probe.status === 401) {
+      const err = new Error(
+        `Received 401 Unauthorized from MCP server (HTTP 401)`,
+      ) as Error & { code: number };
+      err.code = 401;
+      throw err;
+    }
+
     const transport = new StreamableHTTPClientTransport(new URL(url), {
       requestInit: {
         headers,
@@ -393,7 +433,7 @@ serverRouter.post("/mcp", async (req, res) => {
       try {
         serverTransport = await createTransport(req);
       } catch (error) {
-        if (error instanceof SseError && error.code === 401) {
+        if (isUnauthorizedError(error)) {
           logger.error(
             "Received 401 Unauthorized from MCP server:",
             error.message,
@@ -554,7 +594,7 @@ serverRouter.get("/stdio", async (req, res) => {
       serverTransport = await createTransport(req);
       logger.info("Created server transport");
     } catch (error) {
-      if (error instanceof SseError && error.code === 401) {
+      if (isUnauthorizedError(error)) {
         logger.error(
           "Received 401 Unauthorized from MCP server. Authentication failure.",
         );
@@ -750,7 +790,7 @@ serverRouter.get("/sse", async (req, res) => {
     try {
       serverTransport = await createTransport(req);
     } catch (error) {
-      if (error instanceof SseError && error.code === 401) {
+      if (isUnauthorizedError(error)) {
         logger.error(
           "Received 401 Unauthorized from MCP server. Authentication failure.",
         );

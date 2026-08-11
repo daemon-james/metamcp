@@ -44,6 +44,19 @@ export class McpServerPool {
   // stale generation knows to discard its result instead of storing it.
   private idleSessionGenerations: Record<string, number> = {};
 
+  // Last time an ERROR-flagged server was re-dialled, keyed by server UUID.
+  // The health check skips servers in ERROR state, which without this would
+  // make the flag permanent for anything that failed for a transient reason
+  // (upstream restart, brief network loss) — recoverable only by editing the
+  // server in the UI or restarting the process. Retrying on a slow cadence
+  // keeps the flag meaningful and visible while still self-healing.
+  private errorRetryTimestamps: Record<string, number> = {};
+
+  // How long an ERROR-flagged server is left alone before the health check
+  // re-dials it. Long enough not to reproduce the once-a-minute hammering of
+  // an upstream that is rejecting our credentials.
+  private static readonly ERROR_RETRY_INTERVAL_MS = 10 * 60 * 1000;
+
   // Session cleanup timer
   private cleanupTimer: NodeJS.Timeout | null = null;
 
@@ -851,6 +864,7 @@ export class McpServerPool {
 
     // Remove from server params cache
     delete this.serverParamsCache[serverUuid];
+    delete this.errorRetryTimestamps[serverUuid];
   }
 
   /**
@@ -1098,7 +1112,21 @@ export class McpServerPool {
           await serverErrorTracker.isServerInErrorState(serverUuid);
         if (!isError) {
           // Not in error and no idle session - try to create one
+          delete this.errorRetryTimestamps[serverUuid];
           this.createIdleSessionAsync(serverUuid, params);
+        } else {
+          // In error: re-dial occasionally so a server that failed for a
+          // transient reason recovers on its own, without going back to
+          // retrying every 60 seconds. A successful connect clears the flag
+          // (see connectMetaMcpClient); a failed one re-flags it.
+          const lastRetry = this.errorRetryTimestamps[serverUuid] ?? 0;
+          if (Date.now() - lastRetry >= McpServerPool.ERROR_RETRY_INTERVAL_MS) {
+            this.errorRetryTimestamps[serverUuid] = Date.now();
+            logger.info(
+              `Re-dialling server ${serverUuid} flagged ERROR (periodic retry)`,
+            );
+            this.createIdleSessionAsync(serverUuid, params);
+          }
         }
       }
     }

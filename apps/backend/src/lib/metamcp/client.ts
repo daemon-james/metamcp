@@ -184,6 +184,30 @@ export const connectMetaMcpClient = async (
     `Connecting to server ${serverParams.uuid} with max attempts: ${maxAttempts}`,
   );
 
+  // Re-read OAuth tokens from the database on every connect. `serverParams`
+  // usually arrives from `McpServerPool.serverParamsCache`, a snapshot taken
+  // when the server first entered the pool, so its `oauth_tokens` go stale the
+  // moment anything rotates them — a user completing the Connect flow again, a
+  // refresh performed by another code path. Without this the retry loop keeps
+  // presenting the dead access_token it was born with and no amount of
+  // re-authorising in the UI takes effect until the process restarts.
+  if (serverParams.type === "SSE" || serverParams.type === "STREAMABLE_HTTP") {
+    try {
+      const session = await oauthSessionsRepository.findByMcpServerUuid(
+        serverParams.uuid,
+      );
+      if (session?.tokens?.access_token) {
+        serverParams.oauth_tokens = session.tokens;
+      }
+    } catch (error) {
+      // Non-fatal: fall back to whatever the caller supplied.
+      logger.warn(
+        `Failed to reload OAuth tokens for ${serverParams.name} (${serverParams.uuid}):`,
+        error,
+      );
+    }
+  }
+
   // Build a fresh transport+client and run the SDK's initialize handshake.
   // Owns its own cleanup-on-failure so the helper can be called multiple
   // times in a single outer iteration (post-auth fast-retry path) without
@@ -457,6 +481,20 @@ export const connectMetaMcpClient = async (
       retry = count < maxAttempts;
       if (retry) {
         await sleep(waitFor);
+      } else {
+        // Every attempt is spent. Record it so `error_status` reflects
+        // reality: without this only STDIO process crashes could ever set
+        // it, leaving a remote server that needs re-authorisation sitting at
+        // NONE — indistinguishable in the UI from a healthy one — while the
+        // health check re-dialled it with dead credentials once a minute.
+        await serverErrorTracker.recordConnectionFailure(
+          serverParams.uuid,
+          isUpstreamUnauthorizedError(error)
+            ? "upstream rejected the credentials; re-authorisation required"
+            : error instanceof Error
+              ? error.message
+              : "unknown error",
+        );
       }
     }
   }

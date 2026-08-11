@@ -416,6 +416,77 @@ describe("isUpstreamUnauthorizedError", () => {
     expect(isUpstreamUnauthorizedError("just a string")).toBe(false);
   });
 
+  // Regression: SDK 1.29 stopped interpolating the HTTP status into the
+  // message and carries it on `.code` instead. These are the verbatim
+  // shapes observed from mcp.sentry.dev with an expired access_token —
+  // the message mentions neither "401" nor "unauthorized", so message
+  // matching alone classified them as non-auth failures and refresh-on-401
+  // never ran.
+  it("recognises StreamableHTTPError carrying status 401 on .code", () => {
+    class StreamableHTTPError extends Error {
+      constructor(
+        public code: number,
+        message: string,
+      ) {
+        super(`Streamable HTTP error: ${message}`);
+      }
+    }
+    expect(
+      isUpstreamUnauthorizedError(
+        new StreamableHTTPError(
+          401,
+          'Error POSTing to endpoint: {"error":"invalid_token","error_description":"Invalid access token"}',
+        ),
+      ),
+    ).toBe(true);
+  });
+
+  it("recognises SseError carrying status 401 on .code", () => {
+    class SseError extends Error {
+      constructor(
+        public code: number,
+        message: string,
+      ) {
+        super(`SSE error: ${message}`);
+      }
+    }
+    expect(
+      isUpstreamUnauthorizedError(
+        new SseError(401, '{"error":"invalid_token"}'),
+      ),
+    ).toBe(true);
+  });
+
+  it("recognises a numeric `status` property as the upstream status", () => {
+    const error = Object.assign(new Error("token rejected"), { status: 401 });
+    expect(isUpstreamUnauthorizedError(error)).toBe(true);
+  });
+
+  it("ignores non-numeric and negative code properties", () => {
+    // Node syscall errors put a string on `code`.
+    const syscall = Object.assign(new Error("connect failed"), {
+      code: "ECONNREFUSED",
+    });
+    expect(isUpstreamUnauthorizedError(syscall)).toBe(false);
+
+    // JSON-RPC error codes are negative and must not be read as statuses.
+    const jsonRpc = Object.assign(new Error("Connection closed"), {
+      code: -32001,
+    });
+    expect(isUpstreamUnauthorizedError(jsonRpc)).toBe(false);
+  });
+
+  it("applies the 403 envelope rules to a status-carrying 403 too", () => {
+    const bare = Object.assign(new Error("Forbidden by policy"), { code: 403 });
+    expect(isUpstreamUnauthorizedError(bare)).toBe(false);
+
+    const withEnvelope = Object.assign(
+      new Error('Error POSTing to endpoint: {"error":"invalid_token"}'),
+      { code: 403 },
+    );
+    expect(isUpstreamUnauthorizedError(withEnvelope)).toBe(true);
+  });
+
   it("does not false-positive on the word 'authorize' alone", () => {
     expect(
       isUpstreamUnauthorizedError(new Error("authorize endpoint missing")),

@@ -4,6 +4,8 @@ import {
   GetOAuthSessionRequestSchema,
   GetOAuthSessionResponseSchema,
   RefreshOAuthTokenRequestSchema,
+  RegisterOAuthClientRequestSchema,
+  RegisterOAuthClientResponseSchema,
   RefreshOAuthTokenResponseSchema,
   UpsertOAuthSessionRequestSchema,
   UpsertOAuthSessionResponseSchema,
@@ -31,6 +33,10 @@ export const createOAuthRouter = (
       input: z.infer<typeof RefreshOAuthTokenRequestSchema>,
       userId: string,
     ) => Promise<z.infer<typeof RefreshOAuthTokenResponseSchema>>;
+    register: (
+      input: z.infer<typeof RegisterOAuthClientRequestSchema>,
+      userId: string,
+    ) => Promise<z.infer<typeof RegisterOAuthClientResponseSchema>>;
   },
 ) => {
   return router({
@@ -72,6 +78,17 @@ export const createOAuthRouter = (
       .output(RefreshOAuthTokenResponseSchema)
       .mutation(async ({ input, ctx }) => {
         return await implementations.refreshToken(input, ctx.user.id);
+      }),
+
+    // Protected: Server-side dynamic client registration. Same CORS rationale
+    // as exchangeToken — providers such as Sentry answer the preflight on
+    // /oauth/register without Access-Control-Allow-Origin, so a browser can
+    // never register a client and the authorize redirect is never reached.
+    register: protectedProcedure
+      .input(RegisterOAuthClientRequestSchema)
+      .output(RegisterOAuthClientResponseSchema)
+      .mutation(async ({ input, ctx }) => {
+        return await implementations.register(input, ctx.user.id);
       }),
   });
 };

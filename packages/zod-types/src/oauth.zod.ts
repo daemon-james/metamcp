@@ -198,6 +198,27 @@ export const UpsertOAuthSessionResponseSchema = z.union([
 // backend resolves it from the `mcp_servers` row keyed by mcp_server_uuid
 // to prevent an authenticated user from steering discovery + token POST
 // at an attacker-controlled host (SSRF / authorization-code exfiltration).
+// Server-side dynamic client registration. Registration lives on the backend
+// for the same reason the token exchange does: many providers (Sentry among
+// them) answer the CORS preflight on /oauth/register with no
+// Access-Control-Allow-Origin, so the browser can never complete DCR itself.
+export const RegisterOAuthClientRequestSchema = z.object({
+  mcp_server_uuid: z.string().uuid(),
+  client_metadata: z.record(z.string(), z.unknown()),
+});
+
+export const RegisterOAuthClientResponseSchema = z.union([
+  z.object({
+    success: z.literal(true),
+    data: OAuthClientInformationSchema,
+  }),
+  z.object({
+    success: z.literal(false),
+    error: z.string(),
+    error_description: z.string().optional(),
+  }),
+]);
+
 export const ExchangeOAuthTokenRequestSchema = z.object({
   mcp_server_uuid: z.string().uuid(),
   // Authorization code returned in the redirect query string.

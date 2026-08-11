@@ -113,6 +113,33 @@ export class ServerErrorTracker {
   }
 
   /**
+   * Record a server that exhausted every connection attempt and mark it ERROR.
+   *
+   * `recordServerCrash` only ever fires from
+   * `ProcessManagedStdioTransport.onprocesscrash`, so before this existed the
+   * error status was reachable by STDIO servers alone: an SSE or
+   * STREAMABLE_HTTP server whose handshake failed — expired OAuth token,
+   * upstream down, wrong URL — exhausted its retries, returned `undefined`,
+   * and stayed at `error_status = NONE` forever. It looked healthy in the UI,
+   * stayed in the namespace pool poisoning aggregated tool fetches, and the
+   * 60s health check kept re-dialling it indefinitely.
+   *
+   * No counter here: the caller has already burned its full `maxAttempts`
+   * budget by the time it calls this, so the threshold is met by definition.
+   * The flag self-clears — `connectMetaMcpClient` resets it on the next
+   * successful connect.
+   */
+  async recordConnectionFailure(
+    serverUuid: string,
+    reason: string,
+  ): Promise<void> {
+    logger.warn(
+      `Server ${serverUuid} exhausted all connection attempts (${reason}). Marking as ERROR.`,
+    );
+    await this.markServerAsError(serverUuid);
+  }
+
+  /**
    * Mark a server as ERROR
    */
   private async markServerAsError(serverUuid: string): Promise<void> {

@@ -433,7 +433,16 @@ export function useConnection({
               mcpProxyServerUrl.searchParams.append("args", args);
               mcpProxyServerUrl.searchParams.append("env", JSON.stringify(env));
               transportOptions = {
-                authProvider: authProvider,
+                // NOTE: authProvider is deliberately NOT passed here.
+                // This transport talks to MetaMCP's own /mcp-proxy endpoint,
+                // not to the upstream MCP server. Handing it the provider makes
+                // the SDK treat a 401 from the proxy as "the proxy needs
+                // OAuth": it runs discovery against MetaMCP's own origin and
+                // redirects to MetaMCP's /oauth/authorize while presenting the
+                // upstream's client_id. handleAuthError below already runs
+                // auth() with the correct upstream serverUrl. Tokens still
+                // reach the upstream — they are attached as the Authorization
+                // header above and passed through by the proxy.
                 eventSourceInit: {
                   fetch: (
                     url: string | URL | globalThis.Request,
@@ -492,7 +501,16 @@ export function useConnection({
               mcpProxyServerUrl = new URL(`/mcp-proxy/server/mcp`, getAppUrl());
               mcpProxyServerUrl.searchParams.append("url", url);
               transportOptions = {
-                authProvider: authProvider,
+                // NOTE: authProvider is deliberately NOT passed here.
+                // This transport talks to MetaMCP's own /mcp-proxy endpoint,
+                // not to the upstream MCP server. Handing it the provider makes
+                // the SDK treat a 401 from the proxy as "the proxy needs
+                // OAuth": it runs discovery against MetaMCP's own origin and
+                // redirects to MetaMCP's /oauth/authorize while presenting the
+                // upstream's client_id. handleAuthError below already runs
+                // auth() with the correct upstream serverUrl. Tokens still
+                // reach the upstream — they are attached as the Authorization
+                // header above and passed through by the proxy.
                 eventSourceInit: {
                   fetch: (
                     url: string | URL | globalThis.Request,

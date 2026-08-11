@@ -338,6 +338,28 @@ const INVALID_TOKEN_OAUTH_ERROR_CODES = [
 // is treated as a legitimate permission denial — refreshing the token
 // won't make it go away, and burning a rotating refresh_token on it
 // would be worse than no-op.
+// The SDK's HTTP transports carry the upstream response status as a numeric
+// property, NOT in the message. SDK 1.29 formats `StreamableHTTPError` as
+// `Streamable HTTP error: Error POSTing to endpoint: <body>` and `SseError`
+// as `SSE error: <body>` — neither interpolates the status — and both put it
+// on `.code`. A Sentry 401 therefore arrives as
+// `...: {"error":"invalid_token","error_description":"Invalid access token"}`,
+// which matches none of the message patterns below. Reading the status off
+// the error object is what makes refresh-on-401 fire for those transports;
+// without it an expired access_token is never classified as an auth failure
+// and the pool retries with the dead token until `maxAttempts`, once a
+// minute, indefinitely.
+//
+// Only numeric values are accepted: Node syscall errors put a string on
+// `code` (`"ECONNREFUSED"`), and JSON-RPC error codes are negative, so
+// neither can collide with 401/403.
+function upstreamStatusOf(error: Error): number | undefined {
+  const candidate = error as unknown as { code?: unknown; status?: unknown };
+  if (typeof candidate.code === "number") return candidate.code;
+  if (typeof candidate.status === "number") return candidate.status;
+  return undefined;
+}
+
 export function isUpstreamUnauthorizedError(error: unknown): boolean {
   if (!error) return false;
   if (
@@ -350,10 +372,11 @@ export function isUpstreamUnauthorizedError(error: unknown): boolean {
   if (!(error instanceof Error)) return false;
 
   const message = error.message;
+  const status = upstreamStatusOf(error);
 
-  if (/\b401\b|unauthorized/i.test(message)) return true;
+  if (status === 401 || /\b401\b|unauthorized/i.test(message)) return true;
 
-  if (/\b403\b/.test(message)) {
+  if (status === 403 || /\b403\b/.test(message)) {
     const codes = INVALID_TOKEN_OAUTH_ERROR_CODES.join("|");
     const oauthEnvelope = new RegExp(`"error"\\s*:\\s*"(?:${codes})"`);
     if (oauthEnvelope.test(message)) return true;
