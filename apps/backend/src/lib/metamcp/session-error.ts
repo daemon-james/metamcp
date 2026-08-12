@@ -81,10 +81,25 @@ function objectHasSessionLostCode(candidate: unknown): boolean {
   }
   const code = (candidate as { code?: unknown }).code;
   if (typeof code === "number") {
-    return code === -32001 || code === -32600;
+    // 404 is the transport, not the RPC layer: the SDK's StreamableHTTPError
+    // puts the HTTP status on `.code`, so an expired session arrives as
+    // `code === 404`. Requiring the JSON-RPC codes alone missed it, and so did
+    // the message matcher — SDK 1.29 formats the error as
+    // "Streamable HTTP error: Error POSTing to endpoint: <body>", never
+    // interpolating the status, so the HTTP_404 substring cannot appear.
+    // Between them the detector only fired when the upstream happened to put
+    // both the literal words "Session not found" and a -32001/-32600 code in
+    // the body; a 404 with an empty, HTML, or differently-worded body went
+    // unrecovered and failed the caller's request.
+    //
+    // The spec is unambiguous that the status alone is the signal: "When a
+    // client receives HTTP 404 in response to a request containing an
+    // Mcp-Session-Id, it MUST start a new session by sending a new
+    // InitializeRequest without a session ID attached."
+    return code === -32001 || code === -32600 || code === 404;
   }
   if (typeof code === "string") {
-    return code === "-32001" || code === "-32600";
+    return code === "-32001" || code === "-32600" || code === "404";
   }
   return false;
 }

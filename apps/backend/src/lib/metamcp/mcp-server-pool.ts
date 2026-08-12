@@ -3,6 +3,7 @@ import { ServerParameters } from "@repo/zod-types";
 import logger from "@/utils/logger";
 
 import { configService } from "../config.service";
+import { refreshIfExpiring } from "../oauth-upstream/refresh-on-401";
 import { ConnectedClient, connectMetaMcpClient } from "./client";
 import { serverRequiresForwardedHeaders } from "./header-forwarding";
 import { metamcpLogStore } from "./log-store";
@@ -1065,6 +1066,31 @@ export class McpServerPool {
    * Servers in ERROR state whose crash counters have been reset are retried.
    */
   private async checkIdleSessionHealth(): Promise<void> {
+    // Renew OAuth tokens that are close to expiring, before anything tries to
+    // use them. This runs over every remote server the pool knows about, not
+    // just those with a live idle session: a token dies on wall-clock time
+    // regardless of whether the connection is currently up, and an established
+    // session is exactly the case where nothing would otherwise notice until a
+    // real tool call failed. Each call is a single row read unless a refresh
+    // is actually due, and concurrent refreshes for one server collapse into
+    // one upstream POST.
+    await Promise.all(
+      Object.values(this.serverParamsCache)
+        .filter(
+          (params) =>
+            params.type === "SSE" || params.type === "STREAMABLE_HTTP",
+        )
+        .map((params) =>
+          refreshIfExpiring(params).catch((error) => {
+            logger.warn(
+              `Proactive token refresh failed for ${params.name} (${params.uuid}):`,
+              error,
+            );
+            return null;
+          }),
+        ),
+    );
+
     const serverUuids = Object.keys(this.idleSessions);
     if (serverUuids.length === 0) {
       return;

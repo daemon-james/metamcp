@@ -25,6 +25,7 @@ import { ServerParameters } from "@repo/zod-types";
 import { oauthSessionsRepository } from "../../db/repositories";
 import logger from "../../utils/logger";
 import {
+  canonicalResourceUri,
   discoverAuthorizationServerMetadata,
   OAuthTokens,
   redactToken,
@@ -33,6 +34,7 @@ import {
   resolveTokenEndpointAuthMethod,
   UpstreamTokenError,
 } from "./token-exchange";
+import { checkTokenExpiry, DEFAULT_REFRESH_SKEW_SECONDS } from "./token-expiry";
 
 export interface RefreshResult {
   status:
@@ -150,6 +152,7 @@ async function doRefresh(
         typeof currentTokens.scope === "string"
           ? currentTokens.scope
           : undefined,
+      resource: canonicalResourceUri(serverParams.url),
     });
   } catch (error) {
     if (error instanceof UpstreamTokenError) {
@@ -186,3 +189,28 @@ async function doRefresh(
 
   return { status: "refreshed", tokens: newTokens };
 }
+
+// Refresh only if the stored token is at or near expiry. Safe to call on any
+// server and on any cadence: it reads one row, and the underlying refresh is
+// mutex-collapsed, so overlapping callers share a single upstream POST.
+export async function refreshIfExpiring(
+  serverParams: Pick<ServerParameters, "uuid" | "name" | "url">,
+  skewSeconds: number = DEFAULT_REFRESH_SKEW_SECONDS,
+): Promise<RefreshResult | null> {
+  const session = await oauthSessionsRepository.findByMcpServerUuid(
+    serverParams.uuid,
+  );
+  const { expiresAt, shouldRefresh } = checkTokenExpiry(
+    session ?? null,
+    skewSeconds,
+  );
+  if (!shouldRefresh) return null;
+
+  logger.info(
+    `[oauth] token for ${serverParams.name} (${serverParams.uuid}) expires at ` +
+      `${expiresAt?.toISOString()}; refreshing ahead of expiry`,
+  );
+  return tryRefreshUpstreamTokens(serverParams);
+}
+
+export { checkTokenExpiry, DEFAULT_REFRESH_SKEW_SECONDS } from "./token-expiry";

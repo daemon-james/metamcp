@@ -119,8 +119,10 @@ class DbOAuthClientProvider implements OAuthClientProvider {
         const registration =
           await vanillaTrpcClient.frontend.oauth.register.mutate({
             mcp_server_uuid: this.mcpServerUuid,
-            client_metadata: this
-              .clientMetadata as unknown as Record<string, unknown>,
+            client_metadata: this.clientMetadata as unknown as Record<
+              string,
+              unknown
+            >,
           });
         if (registration.success) {
           return await OAuthClientInformationSchema.parseAsync(

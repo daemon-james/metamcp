@@ -4,7 +4,7 @@ import {
   McpServerErrorStatusEnum,
   McpServerUpdateInput,
 } from "@repo/zod-types";
-import { and, desc, eq, isNull, or } from "drizzle-orm";
+import { and, desc, eq, isNull, ne, or } from "drizzle-orm";
 import { DatabaseError } from "pg";
 import { z } from "zod";
 
@@ -259,8 +259,10 @@ export class McpServersRepository {
       .set({
         error_status: McpServerErrorStatusEnum.enum.NONE,
       })
+      // Every flagged state, not just ERROR — an UNAUTHORIZED server is
+      // equally in need of a retry once its credentials have been replaced.
       .where(
-        eq(mcpServersTable.error_status, McpServerErrorStatusEnum.enum.ERROR),
+        ne(mcpServersTable.error_status, McpServerErrorStatusEnum.enum.NONE),
       )
       .returning();
 

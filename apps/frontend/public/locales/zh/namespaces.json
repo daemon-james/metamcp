@@ -169,7 +169,8 @@
     "toggleStatus": "切换 {{name}} 状态",
     "errorStatus": "错误状态",
     "error": "错误",
-    "noError": "无错误"
+    "noError": "无错误",
+    "unauthorized": "需要授权"
   },
   "toolManagement": {
     "toolsOverview": "工具概览：",

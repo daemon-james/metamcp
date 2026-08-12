@@ -1,10 +1,6 @@
 "use client";
 
-import {
-  McpServer,
-  McpServerErrorStatusEnum,
-  McpServerTypeEnum,
-} from "@repo/zod-types";
+import { McpServer, McpServerTypeEnum } from "@repo/zod-types";
 import {
   ColumnDef,
   flexRender,
@@ -58,6 +54,7 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { useTranslations } from "@/hooks/useTranslations";
+import { getErrorStatusDisplay } from "@/lib/error-status";
 import { trpc } from "@/lib/trpc";
 
 interface McpServersListProps {
@@ -207,15 +204,13 @@ export function McpServersList({ onRefresh }: McpServersListProps) {
         );
       },
       cell: ({ row }) => {
-        const errorStatus = row.getValue("error_status") as string;
-        const hasError = errorStatus === McpServerErrorStatusEnum.enum.ERROR;
+        const display = getErrorStatusDisplay(
+          row.getValue("error_status") as string,
+          "list",
+        );
         return (
           <div className="px-3 py-2">
-            <Badge variant={hasError ? "destructive" : "success"}>
-              {hasError
-                ? t("mcp-servers:list.error")
-                : t("mcp-servers:list.noError")}
-            </Badge>
+            <Badge variant={display.variant}>{t(display.labelKey)}</Badge>
           </div>
         );
       },

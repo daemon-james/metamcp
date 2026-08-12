@@ -35,6 +35,7 @@ import {
 import { Skeleton } from "@/components/ui/skeleton";
 import { useConnection } from "@/hooks/useConnection";
 import { useTranslations } from "@/hooks/useTranslations";
+import { getErrorStatusDisplay } from "@/lib/error-status";
 import { trpc } from "@/lib/trpc";
 
 import { ToolManagement } from "./components/tool-management";
@@ -507,16 +508,14 @@ export default function McpServerDetailPage({
                   <div className="flex-1 ml-6 flex justify-end">
                     <Badge
                       variant={
-                        server.error_status ===
-                        McpServerErrorStatusEnum.enum.ERROR
-                          ? "destructive"
-                          : "success"
+                        getErrorStatusDisplay(server.error_status, "detail")
+                          .variant
                       }
                     >
-                      {server.error_status ===
-                      McpServerErrorStatusEnum.enum.ERROR
-                        ? t("mcp-servers:detail.error")
-                        : t("mcp-servers:detail.noError")}
+                      {t(
+                        getErrorStatusDisplay(server.error_status, "detail")
+                          .labelKey,
+                      )}
                     </Badge>
                   </div>
                 </div>

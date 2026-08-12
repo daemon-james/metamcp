@@ -49,7 +49,10 @@ export class OAuthSessionsRepository {
         ...(input.client_information && {
           client_information: input.client_information,
         }),
-        ...(input.tokens && { tokens: input.tokens }),
+        ...(input.tokens && {
+          tokens: input.tokens,
+          tokens_issued_at: sql`NOW()`,
+        }),
         ...(input.code_verifier && { code_verifier: input.code_verifier }),
         ...(input.expected_state && {
           expected_state: input.expected_state,
@@ -89,6 +92,13 @@ export class OAuthSessionsRepository {
     // unique-constraint violation. Only fields present on `input` are written
     // so a partial update (e.g. tokens only) does not clear unrelated columns
     // such as code_verifier.
+    //
+    // `tokens_issued_at` is stamped here rather than by callers so every path
+    // that writes tokens — authorization_code exchange, refresh_token grant,
+    // manual upsert — records the access_token's true age. `updated_at` cannot
+    // stand in for it: it also moves for code_verifier and expected_state
+    // writes, which would make an hour-old token look freshly minted and
+    // suppress the proactive refresh that depends on it.
     const [row] = await db
       .insert(oauthSessionsTable)
       .values({
@@ -96,7 +106,10 @@ export class OAuthSessionsRepository {
         ...(input.client_information && {
           client_information: input.client_information,
         }),
-        ...(input.tokens && { tokens: input.tokens }),
+        ...(input.tokens && {
+          tokens: input.tokens,
+          tokens_issued_at: sql`NOW()`,
+        }),
         ...(input.code_verifier && { code_verifier: input.code_verifier }),
       })
       .onConflictDoUpdate({
@@ -105,7 +118,10 @@ export class OAuthSessionsRepository {
           ...(input.client_information && {
             client_information: input.client_information,
           }),
-          ...(input.tokens && { tokens: input.tokens }),
+          ...(input.tokens && {
+            tokens: input.tokens,
+            tokens_issued_at: sql`NOW()`,
+          }),
           ...(input.code_verifier && { code_verifier: input.code_verifier }),
           updated_at: sql`NOW()`,
         },

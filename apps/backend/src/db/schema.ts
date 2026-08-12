@@ -122,6 +122,14 @@ export const oauthSessionsTable = pgTable(
     // on success (one-shot). NEVER returned to the frontend — the
     // serializer strips it.
     expected_state: text("expected_state"),
+    // When the tokens currently in `tokens` were issued. Written by the
+    // repository on every write that carries tokens, so it tracks the
+    // access_token's actual age rather than the row's — `updated_at` also
+    // moves for code_verifier and expected_state writes, which would make
+    // a token look younger than it is. Combined with `expires_in`, this is
+    // what lets the pool refresh a token before it dies instead of waiting
+    // for the upstream to reject it.
+    tokens_issued_at: timestamp("tokens_issued_at", { withTimezone: true }),
     created_at: timestamp("created_at", { withTimezone: true })
       .notNull()
       .defaultNow(),

@@ -192,7 +192,55 @@ describe("extractForwardedHeaders", () => {
 
   it("should rename headers when client and server names differ", () => {
     const clientHeaders: Record<string, string | string[] | undefined> = {
-      authorization: "Bearer my-token",
+      "x-upstream-key": "Bearer my-token",
+    };
+
+    const serverParams: Record<string, ServerParameters> = {
+      "server-1": makeServer({
+        uuid: "server-1",
+        name: "backend",
+        forward_headers: { "X-Upstream-Key": "X-Backend-Auth" },
+      }),
+    };
+
+    const result = extractForwardedHeaders(clientHeaders, serverParams);
+
+    expect(result).toEqual({
+      "server-1": { "X-Backend-Auth": "Bearer my-token" },
+    });
+  });
+
+  // The deny-list covers the *source* header name, so a caller can still hand
+  // an upstream credential to a backend under any name it likes — it just
+  // cannot nominate the header carrying its own MetaMCP-issued token as the
+  // thing to relay.
+  it("forwards a non-denied source header into the upstream Authorization", () => {
+    const clientHeaders: Record<string, string | string[] | undefined> = {
+      "x-upstream-key": "Bearer upstream-credential",
+    };
+
+    const serverParams: Record<string, ServerParameters> = {
+      "server-1": makeServer({
+        uuid: "server-1",
+        name: "backend",
+        forward_headers: { "X-Upstream-Key": "Authorization" },
+      }),
+    };
+
+    expect(extractForwardedHeaders(clientHeaders, serverParams)).toEqual({
+      "server-1": { Authorization: "Bearer upstream-credential" },
+    });
+  });
+
+  // MCP authorization spec: "MCP clients MUST NOT send tokens to the MCP
+  // server other than ones issued by the MCP server's authorization server."
+  // A downstream agent authenticates to MetaMCP with a MetaMCP-issued bearer,
+  // so whatever sits in its Authorization header is exactly the credential
+  // that must never reach a third-party upstream — under that name or any
+  // other.
+  it("never relays the caller's Authorization header, even renamed", () => {
+    const clientHeaders: Record<string, string | string[] | undefined> = {
+      authorization: "Bearer metamcp-issued-token",
     };
 
     const serverParams: Record<string, ServerParameters> = {
@@ -203,11 +251,7 @@ describe("extractForwardedHeaders", () => {
       }),
     };
 
-    const result = extractForwardedHeaders(clientHeaders, serverParams);
-
-    expect(result).toEqual({
-      "server-1": { "X-Backend-Auth": "Bearer my-token" },
-    });
+    expect(extractForwardedHeaders(clientHeaders, serverParams)).toEqual({});
   });
 });
 
@@ -446,7 +490,7 @@ describe("ForwardHeadersRecordSchema - deny-list validation", () => {
   it("should accept valid non-denied headers", () => {
     expect(
       ForwardHeadersRecordSchema.safeParse({
-        Authorization: "Authorization",
+        "X-Upstream-Key": "X-Upstream-Key",
         "X-Api-Key": "X-Api-Key",
       }).success,
     ).toBe(true);
@@ -455,7 +499,31 @@ describe("ForwardHeadersRecordSchema - deny-list validation", () => {
   it("should accept renamed mappings", () => {
     expect(
       ForwardHeadersRecordSchema.safeParse({
+        "X-Upstream-Key": "X-Backend-Auth",
+      }).success,
+    ).toBe(true);
+  });
+
+  // Rejected at save time as well as filtered at runtime, so the config never
+  // silently looks like it is doing something it will not do.
+  it("rejects Authorization as a forwarding source", () => {
+    expect(
+      ForwardHeadersRecordSchema.safeParse({
+        Authorization: "Authorization",
+      }).success,
+    ).toBe(false);
+    expect(
+      ForwardHeadersRecordSchema.safeParse({
         Authorization: "X-Backend-Auth",
+      }).success,
+    ).toBe(false);
+  });
+
+  // The target name is free-form: only the source is constrained.
+  it("allows Authorization as a forwarding target", () => {
+    expect(
+      ForwardHeadersRecordSchema.safeParse({
+        "X-Upstream-Key": "Authorization",
       }).success,
     ).toBe(true);
   });

@@ -8,10 +8,14 @@ import { ServerParameters } from "@repo/zod-types";
 import logger from "@/utils/logger";
 
 import { oauthSessionsRepository } from "../../db/repositories";
-import { tryRefreshUpstreamTokens } from "../oauth-upstream/refresh-on-401";
+import {
+  refreshIfExpiring,
+  tryRefreshUpstreamTokens,
+} from "../oauth-upstream/refresh-on-401";
 import { recoverFromPostAuthRace } from "../oauth-upstream/retry-post-auth";
 import { isUpstreamUnauthorizedError } from "../oauth-upstream/token-exchange";
 import { ProcessManagedStdioTransport } from "../stdio-transport/process-managed-transport";
+import { mergeSdkHeaders } from "./header-merge";
 import { metamcpLogStore } from "./log-store";
 import { serverErrorTracker } from "./server-error-tracker";
 import { resolveEnvVariables } from "./utils";
@@ -64,10 +68,18 @@ export const createMetaMcpClient = (
     if ((transport as ProcessManagedStdioTransport).stderr) {
       const stderrStream = (transport as ProcessManagedStdioTransport).stderr;
 
+      // stderr is where well-behaved stdio servers write their ordinary
+      // startup and progress output — the MCP spec reserves stdout for the
+      // protocol itself, so anything human-readable has nowhere else to go.
+      // Logging the stream at "error" therefore mislabels every line these
+      // servers emit ("INFO: WebSocket connected" filed as an ERROR), which
+      // both buries real failures and inflates error.log with routine chatter.
+      // Record it at "info"; genuine failures surface as a non-zero exit
+      // through the crash handler, not as the presence of stderr output.
       stderrStream?.on("data", (chunk: Buffer) => {
         metamcpLogStore.addLog(
           serverParams.name,
-          "error",
+          "info",
           chunk.toString().trim(),
         );
       });
@@ -107,7 +119,13 @@ export const createMetaMcpClient = (
           headers,
         },
         eventSourceInit: {
-          fetch: (url, init) => fetch(url, { ...init, headers }),
+          // See mergeSdkHeaders: the SDK's headers carry Accept and the
+          // protocol version and must not be replaced or naively spread.
+          fetch: (url, init) =>
+            fetch(url, {
+              ...init,
+              headers: mergeSdkHeaders(init?.headers, headers),
+            }),
         },
       });
     }
@@ -193,6 +211,12 @@ export const connectMetaMcpClient = async (
   // re-authorising in the UI takes effect until the process restarts.
   if (serverParams.type === "SSE" || serverParams.type === "STREAMABLE_HTTP") {
     try {
+      // Renew first if the stored token is at or past its expiry, so the
+      // handshake is not spent discovering what the clock already knew.
+      // No-ops when the token is healthy, when the provider gave no
+      // `expires_in`, or when there is no refresh_token to use.
+      await refreshIfExpiring(serverParams);
+
       const session = await oauthSessionsRepository.findByMcpServerUuid(
         serverParams.uuid,
       );
@@ -487,13 +511,15 @@ export const connectMetaMcpClient = async (
         // it, leaving a remote server that needs re-authorisation sitting at
         // NONE — indistinguishable in the UI from a healthy one — while the
         // health check re-dialled it with dead credentials once a minute.
+        const unauthorized = isUpstreamUnauthorizedError(error);
         await serverErrorTracker.recordConnectionFailure(
           serverParams.uuid,
-          isUpstreamUnauthorizedError(error)
+          unauthorized
             ? "upstream rejected the credentials; re-authorisation required"
             : error instanceof Error
               ? error.message
               : "unknown error",
+          unauthorized,
         );
       }
     }

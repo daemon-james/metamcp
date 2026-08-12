@@ -149,6 +149,35 @@ async function postFormToToken({
   return tokens;
 }
 
+// RFC 8707 resource indicator for the MCP server being authorised.
+//
+// The MCP authorization spec makes this mandatory on BOTH legs: "The
+// `resource` parameter MUST be included in both authorization requests and
+// token requests", and "MCP clients MUST send this parameter regardless of
+// whether authorization servers support it."
+//
+// Sending it on the authorize leg but not the token leg — which is what
+// happened here, because the browser's authorize URL is built by the SDK
+// (which sets it) while the token POST is hand-rolled on the backend (which
+// did not) — is worse than omitting it consistently. RFC 8707 §2.2 has the
+// authorization server narrow the token's audience to the requested
+// resource; when the token request drops it, audience-issuing providers
+// either mint a token for the wrong audience or reject the request with
+// `invalid_target`. A wrong-audience token is then rejected forever by the
+// resource server, and no amount of refreshing can repair it.
+//
+// The canonical form is the server URL with any fragment removed, matching
+// the SDK's own `resourceUrlFromServerUrl`.
+export function canonicalResourceUri(serverUrl: string): string | undefined {
+  try {
+    const url = new URL(serverUrl);
+    url.hash = "";
+    return url.href;
+  } catch {
+    return undefined;
+  }
+}
+
 export interface ExchangeAuthorizationCodeInput {
   tokenEndpoint: string;
   code: string;
@@ -157,6 +186,8 @@ export interface ExchangeAuthorizationCodeInput {
   clientId: string;
   clientSecret?: string;
   authMethod: TokenEndpointAuthMethod;
+  // Canonical URI of the MCP server the token is for (RFC 8707).
+  resource?: string;
   fetchImpl?: typeof fetch;
 }
 
@@ -169,6 +200,9 @@ export async function exchangeAuthorizationCode(
     code_verifier: input.codeVerifier,
     redirect_uri: input.redirectUri,
   });
+  if (input.resource) {
+    params.set("resource", input.resource);
+  }
 
   return postFormToToken({
     tokenEndpoint: input.tokenEndpoint,
@@ -187,6 +221,8 @@ export interface RefreshAccessTokenInput {
   clientSecret?: string;
   authMethod: TokenEndpointAuthMethod;
   scope?: string;
+  // Canonical URI of the MCP server the token is for (RFC 8707).
+  resource?: string;
   fetchImpl?: typeof fetch;
 }
 
@@ -199,6 +235,9 @@ export async function refreshAccessToken(
   });
   if (input.scope) {
     params.set("scope", input.scope);
+  }
+  if (input.resource) {
+    params.set("resource", input.resource);
   }
 
   const tokens = await postFormToToken({

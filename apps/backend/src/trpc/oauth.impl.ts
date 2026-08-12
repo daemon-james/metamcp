@@ -25,6 +25,7 @@ import {
 import { OAuthSessionsSerializer } from "../db/serializers";
 import { tryRefreshUpstreamTokens } from "../lib/oauth-upstream/refresh-on-401";
 import {
+  canonicalResourceUri,
   discoverAuthorizationServerMetadata,
   exchangeAuthorizationCode,
   OAuthTokens,
@@ -321,6 +322,9 @@ export const oauthImplementations = {
         clientId,
         clientSecret,
         authMethod,
+        // RFC 8707. `serverUrl` is the DB-resolved URL, never caller input,
+        // so this cannot be steered at an attacker-chosen audience.
+        resource: canonicalResourceUri(serverUrl),
       });
     } catch (error) {
       if (error instanceof UpstreamTokenError) {

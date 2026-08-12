@@ -3,7 +3,32 @@ import { z } from "zod";
 export const McpServerTypeEnum = z.enum(["STDIO", "SSE", "STREAMABLE_HTTP"]);
 export const McpServerStatusEnum = z.enum(["ACTIVE", "INACTIVE"]);
 
-export const McpServerErrorStatusEnum = z.enum(["NONE", "ERROR"]);
+// NONE          — healthy, or at least not known to be broken.
+// UNAUTHORIZED  — the upstream rejected our credentials. A human has to
+//                 re-authorise; retrying cannot fix it. Kept distinct from
+//                 ERROR because the remedy is completely different and the
+//                 UI can offer a one-click Reconnect for it.
+// ERROR         — failed for any other reason: process crashed, host
+//                 unreachable, handshake rejected.
+export const McpServerErrorStatusEnum = z.enum([
+  "NONE",
+  "UNAUTHORIZED",
+  "ERROR",
+]);
+
+export type McpServerErrorStatus = z.infer<typeof McpServerErrorStatusEnum>;
+
+// A server is "flagged" when it is in any state other than NONE. Callers that
+// ask "is this server broken?" must use this rather than comparing against
+// ERROR: an equality check silently answers "no" for UNAUTHORIZED, which would
+// put a server with rejected credentials straight back into the connection
+// pool and the 60-second re-dial loop.
+export const isFlaggedErrorStatus = (
+  status: string | null | undefined,
+): boolean =>
+  status !== undefined &&
+  status !== null &&
+  status !== McpServerErrorStatusEnum.enum.NONE;
 
 /**
  * RFC 7230 token characters for HTTP header field names.
@@ -27,6 +52,15 @@ export const DENIED_FORWARD_HEADERS = new Set([
   "trailer",
   "upgrade",
   "keep-alive",
+  // A downstream agent's bearer token is issued by MetaMCP's own
+  // authorization server and is valid only for MetaMCP. Forwarding it to a
+  // third-party upstream hands that upstream a credential it can replay
+  // against us, and the MCP spec forbids it outright: "MCP clients MUST NOT
+  // send tokens to the MCP server other than ones issued by the MCP server's
+  // authorization server." `proxy-authorization` was denied but plain
+  // `authorization` was not, so a forward_headers entry naming it would relay
+  // the token verbatim to any server that had no stored credential of its own.
+  "authorization",
   "proxy-authorization",
   "proxy-authenticate",
   "proxy-connection",

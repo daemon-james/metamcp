@@ -1,4 +1,8 @@
-import { McpServerErrorStatusEnum } from "@repo/zod-types";
+import {
+  isFlaggedErrorStatus,
+  McpServerErrorStatus,
+  McpServerErrorStatusEnum,
+} from "@repo/zod-types";
 
 import logger from "@/utils/logger";
 
@@ -128,31 +132,54 @@ export class ServerErrorTracker {
    * budget by the time it calls this, so the threshold is met by definition.
    * The flag self-clears — `connectMetaMcpClient` resets it on the next
    * successful connect.
+   *
+   * `unauthorized` separates the two failures that need completely different
+   * responses. A server whose credentials were rejected cannot be fixed by
+   * retrying — a human has to supply new ones — whereas an unreachable host
+   * or a crashed process usually recovers by itself. Collapsing both into
+   * ERROR tells the operator a server is broken but never which of those it
+   * is, so it is never clear whether to wait or to act.
    */
   async recordConnectionFailure(
     serverUuid: string,
     reason: string,
+    unauthorized = false,
   ): Promise<void> {
+    const status = unauthorized
+      ? McpServerErrorStatusEnum.enum.UNAUTHORIZED
+      : McpServerErrorStatusEnum.enum.ERROR;
     logger.warn(
-      `Server ${serverUuid} exhausted all connection attempts (${reason}). Marking as ERROR.`,
+      `Server ${serverUuid} exhausted all connection attempts (${reason}). Marking as ${status}.`,
     );
-    await this.markServerAsError(serverUuid);
+    await this.markServerAs(serverUuid, status);
   }
 
   /**
    * Mark a server as ERROR
    */
   private async markServerAsError(serverUuid: string): Promise<void> {
+    await this.markServerAs(serverUuid, McpServerErrorStatusEnum.enum.ERROR);
+  }
+
+  private async markServerAs(
+    serverUuid: string,
+    errorStatus: McpServerErrorStatus,
+  ): Promise<void> {
     try {
       // Update the server-level error status
       await mcpServersRepository.updateServerErrorStatus({
         serverUuid,
-        errorStatus: McpServerErrorStatusEnum.enum.ERROR,
+        errorStatus,
       });
 
-      logger.error(`Server ${serverUuid} marked as ERROR at server level`);
+      logger.error(
+        `Server ${serverUuid} marked as ${errorStatus} at server level`,
+      );
     } catch (error) {
-      logger.error(`Error marking server ${serverUuid} as ERROR:`, error);
+      logger.error(
+        `Error marking server ${serverUuid} as ${errorStatus}:`,
+        error,
+      );
     }
   }
 
@@ -183,7 +210,7 @@ export class ServerErrorTracker {
   async isServerInErrorState(serverUuid: string): Promise<boolean> {
     try {
       const server = await mcpServersRepository.findByUuid(serverUuid);
-      return server?.error_status === McpServerErrorStatusEnum.enum.ERROR;
+      return isFlaggedErrorStatus(server?.error_status);
     } catch (error) {
       logger.error(
         `Error checking server error state for ${serverUuid}:`,

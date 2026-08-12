@@ -1,3 +1,4 @@
+import { isFlaggedErrorStatus } from "@repo/zod-types";
 import express from "express";
 
 import { authenticateApiKey } from "@/middleware/api-key-oauth.middleware";
@@ -39,8 +40,8 @@ adminRouter.post(
       } else {
         // Reset all servers in ERROR state
         const allServers = await mcpServersRepository.findAll();
-        const errorServers = allServers.filter(
-          (s) => s.error_status === "ERROR",
+        const errorServers = allServers.filter((s) =>
+          isFlaggedErrorStatus(s.error_status),
         );
 
         for (const server of errorServers) {
@@ -101,8 +102,8 @@ adminRouter.get(
         attempts: serverErrorTracker.getServerAttempts(s.uuid),
       }));
 
-      const errorCount = serverStatuses.filter(
-        (s) => s.error_status === "ERROR",
+      const errorCount = serverStatuses.filter((s) =>
+        isFlaggedErrorStatus(s.error_status),
       ).length;
 
       res.json({

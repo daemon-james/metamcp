@@ -1,10 +1,6 @@
 "use client";
 
-import {
-  McpServerErrorStatusEnum,
-  McpServerTypeEnum,
-  NamespaceServer,
-} from "@repo/zod-types";
+import { McpServerTypeEnum, NamespaceServer } from "@repo/zod-types";
 import {
   ColumnDef,
   flexRender,
@@ -48,6 +44,7 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { useTranslations } from "@/hooks/useTranslations";
+import { getErrorStatusDisplay } from "@/lib/error-status";
 import { trpc } from "@/lib/trpc";
 
 interface NamespaceServersTableProps {
@@ -276,15 +273,13 @@ export function NamespaceServersTable({
         );
       },
       cell: ({ row }) => {
-        const errorStatus = row.getValue("error_status") as string;
-        const hasError = errorStatus === McpServerErrorStatusEnum.enum.ERROR;
+        const display = getErrorStatusDisplay(
+          row.getValue("error_status") as string,
+          "serversTable",
+        );
         return (
           <div className="px-3 py-2">
-            <Badge variant={hasError ? "destructive" : "success"}>
-              {hasError
-                ? t("namespaces:serversTable.error")
-                : t("namespaces:serversTable.noError")}
-            </Badge>
+            <Badge variant={display.variant}>{t(display.labelKey)}</Badge>
           </div>
         );
       },

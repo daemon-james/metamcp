@@ -178,7 +178,8 @@
     "toggleTooFastDescription": "충돌을 방지하기 위해 이 Server를 다시 토글하기 전에 잠시 기다려 주세요.",
     "errorStatus": "오류 상태",
     "error": "오류",
-    "noError": "오류 없음"
+    "noError": "오류 없음",
+    "unauthorized": "인증 필요"
   },
   "toolManagement": {
     "toolsOverview": "Tool 개요:",

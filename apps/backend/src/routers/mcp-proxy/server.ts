@@ -9,7 +9,7 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
-import { McpServerErrorStatusEnum, McpServerTypeEnum } from "@repo/zod-types";
+import { isFlaggedErrorStatus, McpServerTypeEnum } from "@repo/zod-types";
 import express from "express";
 import { parse as shellParseArgs } from "shell-quote";
 import { findActualExecutable } from "spawn-rx";
@@ -153,8 +153,7 @@ const checkServerErrorStatus = async (serverUuid: string): Promise<boolean> => {
       return false;
     }
 
-    const isInError =
-      server.error_status === McpServerErrorStatusEnum.enum.ERROR;
+    const isInError = isFlaggedErrorStatus(server.error_status);
     if (isInError) {
       logger.info(`Server ${server.name} (${serverUuid}) is in ERROR state`);
     }
