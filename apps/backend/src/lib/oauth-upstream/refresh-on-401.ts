@@ -24,9 +24,9 @@ import { ServerParameters } from "@repo/zod-types";
 
 import { oauthSessionsRepository } from "../../db/repositories";
 import logger from "../../utils/logger";
+import { resolveAuthorizationServer } from "./discovery";
 import {
   canonicalResourceUri,
-  discoverAuthorizationServerMetadata,
   OAuthTokens,
   redactToken,
   refreshAccessToken,
@@ -119,9 +119,11 @@ async function doRefresh(
       ? (clientInformation.client_secret as string)
       : undefined;
 
-  const discovered = await discoverAuthorizationServerMetadata(
-    serverParams.url,
-  );
+  // Full discovery chain: protected-resource metadata names the issuer, whose
+  // own metadata carries the token endpoint. Falls back to the MCP server's
+  // origin for servers that host their own endpoints.
+  const resolved = await resolveAuthorizationServer(serverParams.url);
+  const discovered = resolved.metadata;
   const tokenEndpoint = resolveTokenEndpoint({
     clientInformation,
     discovered,
@@ -152,7 +154,9 @@ async function doRefresh(
         typeof currentTokens.scope === "string"
           ? currentTokens.scope
           : undefined,
-      resource: canonicalResourceUri(serverParams.url),
+      // Prefer the identifier the resource publishes for itself; the
+      // authorization server matches against that exact string.
+      resource: resolved.resource ?? canonicalResourceUri(serverParams.url),
     });
   } catch (error) {
     if (error instanceof UpstreamTokenError) {

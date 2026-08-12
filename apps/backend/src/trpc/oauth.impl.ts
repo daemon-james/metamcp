@@ -23,10 +23,10 @@ import {
   oauthSessionsRepository,
 } from "../db/repositories";
 import { OAuthSessionsSerializer } from "../db/serializers";
+import { resolveAuthorizationServer } from "../lib/oauth-upstream/discovery";
 import { tryRefreshUpstreamTokens } from "../lib/oauth-upstream/refresh-on-401";
 import {
   canonicalResourceUri,
-  discoverAuthorizationServerMetadata,
   exchangeAuthorizationCode,
   OAuthTokens,
   redactToken,
@@ -292,7 +292,8 @@ export const oauthImplementations = {
         ? (clientInformation.client_secret as string)
         : undefined;
 
-    const discovered = await discoverAuthorizationServerMetadata(serverUrl);
+    const resolvedAs = await resolveAuthorizationServer(serverUrl);
+    const discovered = resolvedAs.metadata;
     const tokenEndpoint = resolveTokenEndpoint({
       clientInformation,
       discovered,
@@ -324,7 +325,7 @@ export const oauthImplementations = {
         authMethod,
         // RFC 8707. `serverUrl` is the DB-resolved URL, never caller input,
         // so this cannot be steered at an attacker-chosen audience.
-        resource: canonicalResourceUri(serverUrl),
+        resource: resolvedAs.resource ?? canonicalResourceUri(serverUrl),
       });
     } catch (error) {
       if (error instanceof UpstreamTokenError) {
@@ -494,7 +495,7 @@ export const oauthImplementations = {
     const serverUrl = serverResolution.url;
 
     try {
-      const metadata = await discoverAuthorizationServerMetadata(serverUrl);
+      const metadata = (await resolveAuthorizationServer(serverUrl)).metadata;
       if (!metadata) {
         return {
           success: false as const,
