@@ -1163,20 +1163,52 @@ export class McpServerPool {
     if (servers.length === 0) return;
 
     await Promise.all(
-      servers.map((server) =>
-        refreshIfExpiring({
-          uuid: server.uuid,
-          name: server.name,
-          url: server.url,
-        }).catch((error) => {
+      servers.map(async (server) => {
+        let result;
+        try {
+          result = await refreshIfExpiring({
+            uuid: server.uuid,
+            name: server.name,
+            url: server.url,
+          });
+        } catch (error) {
           logger.warn(
             `Proactive token refresh failed for ${server.name} (${server.uuid}):`,
             error,
           );
-          return null;
-        }),
-      ),
+          return;
+        }
+        if (result?.status !== "refreshed") return;
+
+        // The open session still presents the token that was just rotated
+        // away, so its next health-check ping fails and it is rebuilt anyway
+        // — one guaranteed failed request per refresh, which is exactly the
+        // kind of self-healing that hides a defect rather than avoiding one.
+        // Retiring the session here means the replacement is built from the
+        // new credentials on the next cycle.
+        await this.discardIdleSession(server.uuid);
+      }),
     );
+  }
+
+  /**
+   * Close and forget a server's idle session. The health check recreates it on
+   * its next pass, using whatever parameters and credentials are current then.
+   */
+  private async discardIdleSession(serverUuid: string): Promise<void> {
+    const idle = this.idleSessions[serverUuid];
+    if (!idle) return;
+    delete this.idleSessions[serverUuid];
+    this.idleSessionGenerations[serverUuid] =
+      (this.idleSessionGenerations[serverUuid] ?? 0) + 1;
+    try {
+      await idle.cleanup();
+    } catch (error) {
+      logger.debug(
+        `Ignoring cleanup error while retiring idle session for ${serverUuid}:`,
+        error,
+      );
+    }
   }
 
   /**

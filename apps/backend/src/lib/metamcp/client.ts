@@ -15,6 +15,10 @@ import {
 import { recoverFromPostAuthRace } from "../oauth-upstream/retry-post-auth";
 import { isUpstreamUnauthorizedError } from "../oauth-upstream/token-exchange";
 import { ProcessManagedStdioTransport } from "../stdio-transport/process-managed-transport";
+import {
+  describeTerminalConnectionError,
+  isTerminalConnectionError,
+} from "./connection-errors";
 import { mergeSdkHeaders } from "./header-merge";
 import { metamcpLogStore } from "./log-store";
 import { serverErrorTracker } from "./server-error-tracker";
@@ -312,6 +316,28 @@ export const connectMetaMcpClient = async (
       return {
         client: connectedClient,
         cleanup: async () => {
+          // Tell the upstream the session is finished before dropping it.
+          // `close()` only tears down our side — it sends nothing — so every
+          // recycled, invalidated or health-check-replaced connection used to
+          // abandon a session the server holds until its own timeout. MetaMCP
+          // churns these constantly, and on servers that cap sessions per
+          // client that accumulates into refusals hours later with nothing
+          // pointing back here. The spec asks clients to send the DELETE;
+          // a server declining it (405) is equally legitimate, so failure
+          // here is not worth surfacing.
+          if (
+            connectedTransport instanceof StreamableHTTPClientTransport &&
+            connectedTransport.sessionId
+          ) {
+            try {
+              await connectedTransport.terminateSession();
+            } catch (error) {
+              logger.debug(
+                `Upstream declined session termination for ${serverParams.name} (${serverParams.uuid}):`,
+                error,
+              );
+            }
+          }
           await connectedTransport.close();
           await connectedClient.close();
         },
@@ -499,6 +525,22 @@ export const connectMetaMcpClient = async (
             recoveryError,
           );
         }
+      }
+
+      // A disagreement about the protocol has the same answer every time.
+      // Spending the rest of the budget re-asking, then re-dialling every ten
+      // minutes forever, produces noise and tells the operator nothing about
+      // what is actually wrong.
+      if (isTerminalConnectionError(error)) {
+        const reason = describeTerminalConnectionError(error);
+        logger.warn(
+          `Not retrying ${serverParams.name} (${serverParams.uuid}): ${reason}`,
+        );
+        await serverErrorTracker.recordConnectionFailure(
+          serverParams.uuid,
+          reason,
+        );
+        return undefined;
       }
 
       count++;
