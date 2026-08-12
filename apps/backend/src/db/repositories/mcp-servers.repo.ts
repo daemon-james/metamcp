@@ -2,9 +2,10 @@ import {
   DatabaseMcpServer,
   McpServerCreateInput,
   McpServerErrorStatusEnum,
+  McpServerTypeEnum,
   McpServerUpdateInput,
 } from "@repo/zod-types";
-import { and, desc, eq, isNull, ne, or } from "drizzle-orm";
+import { and, desc, eq, isNotNull, isNull, ne, or } from "drizzle-orm";
 import { DatabaseError } from "pg";
 import { z } from "zod";
 
@@ -253,6 +254,30 @@ export class McpServersRepository {
    * Reset error_status to NONE for all servers that are currently in ERROR state.
    * Used on startup to give servers a fresh chance.
    */
+  /**
+   * Remote servers that could hold OAuth credentials — everything that is not
+   * STDIO and has a URL. Used by the pool's proactive refresh sweep, which
+   * must cover every server with stored tokens rather than only those the
+   * connection pool happens to have cached.
+   */
+  async findOAuthCapableServers(): Promise<
+    Array<{ uuid: string; name: string; url: string | null }>
+  > {
+    return db
+      .select({
+        uuid: mcpServersTable.uuid,
+        name: mcpServersTable.name,
+        url: mcpServersTable.url,
+      })
+      .from(mcpServersTable)
+      .where(
+        and(
+          ne(mcpServersTable.type, McpServerTypeEnum.enum.STDIO),
+          isNotNull(mcpServersTable.url),
+        ),
+      );
+  }
+
   async resetAllErrorStatuses(): Promise<number> {
     const updated = await db
       .update(mcpServersTable)

@@ -2,6 +2,7 @@ import { ServerParameters } from "@repo/zod-types";
 
 import logger from "@/utils/logger";
 
+import { mcpServersRepository } from "../../db/repositories";
 import { configService } from "../config.service";
 import { refreshIfExpiring } from "../oauth-upstream/refresh-on-401";
 import { ConnectedClient, connectMetaMcpClient } from "./client";
@@ -1067,29 +1068,8 @@ export class McpServerPool {
    */
   private async checkIdleSessionHealth(): Promise<void> {
     // Renew OAuth tokens that are close to expiring, before anything tries to
-    // use them. This runs over every remote server the pool knows about, not
-    // just those with a live idle session: a token dies on wall-clock time
-    // regardless of whether the connection is currently up, and an established
-    // session is exactly the case where nothing would otherwise notice until a
-    // real tool call failed. Each call is a single row read unless a refresh
-    // is actually due, and concurrent refreshes for one server collapse into
-    // one upstream POST.
-    await Promise.all(
-      Object.values(this.serverParamsCache)
-        .filter(
-          (params) =>
-            params.type === "SSE" || params.type === "STREAMABLE_HTTP",
-        )
-        .map((params) =>
-          refreshIfExpiring(params).catch((error) => {
-            logger.warn(
-              `Proactive token refresh failed for ${params.name} (${params.uuid}):`,
-              error,
-            );
-            return null;
-          }),
-        ),
-    );
+    // use them.
+    await this.refreshExpiringTokens();
 
     const serverUuids = Object.keys(this.idleSessions);
     if (serverUuids.length === 0) {
@@ -1156,6 +1136,47 @@ export class McpServerPool {
         }
       }
     }
+  }
+
+  /**
+   * Renew every stored OAuth token that is close to expiring.
+   *
+   * Driven off the database rather than `serverParamsCache`. A token dies on
+   * wall-clock time whether or not the pool currently holds the server, and
+   * the cache is only populated as sessions are created — so a sweep over it
+   * silently covers a subset, which is indistinguishable from having nothing
+   * to do. Reading the servers that actually have credentials makes the set
+   * explicit and complete.
+   *
+   * Each entry costs one indexed read unless a refresh is genuinely due, and
+   * concurrent refreshes for the same server collapse into a single upstream
+   * POST via the refresh mutex.
+   */
+  private async refreshExpiringTokens(): Promise<void> {
+    let servers: Array<{ uuid: string; name: string; url: string | null }>;
+    try {
+      servers = await mcpServersRepository.findOAuthCapableServers();
+    } catch (error) {
+      logger.warn("Could not list servers for proactive token refresh:", error);
+      return;
+    }
+    if (servers.length === 0) return;
+
+    await Promise.all(
+      servers.map((server) =>
+        refreshIfExpiring({
+          uuid: server.uuid,
+          name: server.name,
+          url: server.url,
+        }).catch((error) => {
+          logger.warn(
+            `Proactive token refresh failed for ${server.name} (${server.uuid}):`,
+            error,
+          );
+          return null;
+        }),
+      ),
+    );
   }
 
   /**
