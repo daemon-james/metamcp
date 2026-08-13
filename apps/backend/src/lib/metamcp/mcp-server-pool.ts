@@ -9,6 +9,7 @@ import { ConnectedClient, connectMetaMcpClient } from "./client";
 import { serverRequiresForwardedHeaders } from "./header-forwarding";
 import { metamcpLogStore } from "./log-store";
 import { serverErrorTracker } from "./server-error-tracker";
+import { isClientSharedWithOtherSessions } from "./shared-connection";
 
 export interface McpServerPoolStatus {
   idle: number;
@@ -514,9 +515,28 @@ export class McpServerPool {
 
     let recycled = 0;
     let destroyed = 0;
+    let sharedRetained = 0;
 
     // Try to recycle each connection back to idle pool
     for (const [serverUuid, client] of Object.entries(activeSession)) {
+      // At the per-server cap, getSession() hands the SAME ConnectedClient to
+      // more than one client session. Releasing it here — by destroying it, or
+      // by parking it in the idle pool where the health check owns it — would
+      // tear the transport out from under a sibling session that is still
+      // using it, whose next call then fails with "Not connected". Leave it to
+      // whichever session releases it last.
+      if (
+        isClientSharedWithOtherSessions({
+          activeSessions: this.activeSessions,
+          sessionId,
+          serverUuid,
+          client,
+        })
+      ) {
+        sharedRetained++;
+        continue;
+      }
+
       if (!this.idleSessions[serverUuid]) {
         // No idle session for this server — recycle the connection
         this.idleSessions[serverUuid] = client;
@@ -548,7 +568,7 @@ export class McpServerPool {
     delete this.sessionToServers[sessionId];
 
     logger.info(
-      `Cleaned up session ${sessionId} (recycled: ${recycled}, destroyed: ${destroyed})`,
+      `Cleaned up session ${sessionId} (recycled: ${recycled}, destroyed: ${destroyed}, shared-retained: ${sharedRetained})`,
     );
   }
 
