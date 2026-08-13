@@ -56,7 +56,7 @@ import {
   createToolOverridesListToolsMiddleware,
   mapOverrideNameToOriginal,
 } from "./metamcp-middleware/tool-overrides.functional";
-import { isBackendSessionLostError } from "./session-error";
+import { isRecoverableBackendError } from "./session-error";
 import { parseToolName } from "./tool-name-parser";
 import { toolsSyncCache } from "./tools-sync-cache";
 import { sanitizeName } from "./utils";
@@ -485,6 +485,9 @@ export const createServer = async (
           );
 
           if (session) {
+            // Recovery may swap in a fresh connection mid-lookup; everything
+            // downstream must bind to the replacement, not the dead original.
+            let activeSession = session;
             const capabilities = session.client.getServerCapabilities();
             if (!capabilities?.tools) continue;
 
@@ -495,38 +498,61 @@ export const createServer = async (
             if (sanitizeName(serverName) === serverPrefix) {
               // Found the server, now check if it has this tool with pagination
               try {
-                let foundTool = false;
-                let cursor: string | undefined = undefined;
-                let hasMore = true;
+                // Paginate this server's catalogue looking for the tool. Wrapped
+                // in the recovery cascade because a dead pooled session here used
+                // to be swallowed by the catch below: the loop logged, moved to
+                // the next server, found nothing, and the caller reported
+                // "Unknown tool: <name>" — a misleading 'this tool does not
+                // exist' for what is really 'the connection died'. Production
+                // 2026-08-13 saw exactly that for mnemonik__memory_discover.
+                const found = await requestWithSessionRecovery({
+                  pool: mcpServerPool,
+                  sessionId,
+                  serverUuid: mcpServerUuid,
+                  params: effectiveParams,
+                  namespaceUuid,
+                  operation: "tools/list (dynamic tool lookup)",
+                  serverName,
+                  session,
+                  onFreshSession: (fresh) => {
+                    activeSession = fresh;
+                  },
+                  attempt: async (attemptSession) => {
+                    let cursor: string | undefined = undefined;
+                    let hasMore = true;
 
-                while (hasMore && !foundTool) {
-                  const result: ListToolsResult = await session.client.request(
-                    {
-                      method: "tools/list",
-                      params: { cursor: cursor },
-                    },
-                    ListToolsResultSchema,
-                  );
+                    while (hasMore) {
+                      const result: ListToolsResult =
+                        await attemptSession.client.request(
+                          {
+                            method: "tools/list",
+                            params: { cursor: cursor },
+                          },
+                          ListToolsResultSchema,
+                        );
 
-                  if (
-                    result.tools?.some(
-                      (tool: Tool) => tool.name === originalToolName,
-                    )
-                  ) {
-                    foundTool = true;
-                    // Tool exists, populate mappings for future use and use it
-                    clientForTool = session;
-                    serverUuid = mcpServerUuid;
-                    toolToClient[name] = session;
-                    toolToServerUuid[name] = mcpServerUuid;
-                    break;
-                  }
+                      if (
+                        result.tools?.some(
+                          (tool: Tool) => tool.name === originalToolName,
+                        )
+                      ) {
+                        return true;
+                      }
 
-                  cursor = result.nextCursor;
-                  hasMore = !!result.nextCursor;
-                }
+                      cursor = result.nextCursor;
+                      hasMore = !!result.nextCursor;
+                    }
 
-                if (foundTool) {
+                    return false;
+                  },
+                });
+
+                if (found) {
+                  // Tool exists, populate mappings for future use and use it
+                  clientForTool = activeSession;
+                  serverUuid = mcpServerUuid;
+                  toolToClient[name] = activeSession;
+                  toolToServerUuid[name] = mcpServerUuid;
                   break;
                 }
               } catch (error) {
@@ -584,7 +610,16 @@ export const createServer = async (
     try {
       return (await callOnce(clientForTool)) as CallToolResult;
     } catch (error) {
-      if (!isBackendSessionLostError(error)) {
+      // Must be the WIDE predicate. `isBackendSessionLostError` only matches the
+      // backend's "Session not found" / HTTP 404 envelope; it does NOT match the
+      // SDK's bare `Error: Not connected`, which is what a locally torn-down
+      // transport throws — and that is the overwhelmingly common case (a sibling
+      // session's cleanup released a shared connection, a stdio child was
+      // SIGTERMed, the backend container restarted). Production 2026-08-13: 5
+      // "Not connected" tool-call failures, 0 recovery attempts, because they all
+      // fell through this guard to the rethrow below. The sibling list path
+      // (list-handler-recovery.ts) has always used the wide predicate.
+      if (!isRecoverableBackendError(error)) {
         logger.error(
           `Error calling tool "${name}" through ${
             clientForTool.client.getServerVersion()?.name || "unknown"
@@ -595,7 +630,9 @@ export const createServer = async (
       }
 
       logger.warn(
-        `Backend reported session lost for server ${serverUuid} on tool "${name}"; invalidating pool and retrying once.`,
+        `Backend connection lost for server ${serverUuid} on tool "${name}"; invalidating pool and retrying once. (envelope: ${
+          error instanceof Error ? error.message : String(error)
+        })`,
       );
 
       await mcpServerPool.invalidateServerConnection(sessionId, serverUuid);
