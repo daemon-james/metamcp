@@ -5,11 +5,24 @@
 RIG="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 set -euo pipefail
 cd /home/dev/projects/metamcp/apps/backend
-if [ -f "$RIG"/app.pid ]; then
-  kill "$(cat "$RIG"/app.pid)" 2>/dev/null || true
-  rm -f "$RIG"/app.pid
+# Kill by PORT, not just by pid file. A backend started outside this script
+# (a raw nohup, a crashed run whose pid file was overwritten) keeps :12009 and
+# silently serves every probe, so the rig measures code you are not editing.
+# That happened on 2026-08-23: a process from three hours earlier answered a
+# whole fault matrix and made a working fix look broken.
+for _ in 1 2 3; do
+  # `|| true`: under `set -euo pipefail` a grep that matches nothing returns 1
+  # and kills the script silently, which looks exactly like a clean start.
+  holder="$(ss -ltnp 2>/dev/null | grep ':12009 ' | grep -oE 'pid=[0-9]+' | head -1 | cut -d= -f2 || true)"
+  [ -z "$holder" ] && break
+  kill "$holder" 2>/dev/null || true
   sleep 2
+done
+if ss -ltn 2>/dev/null | grep -q ':12009 '; then
+  echo "PORT 12009 STILL HELD after 3 kill attempts; refusing to start and report stale results" >&2
+  exit 1
 fi
+rm -f "$RIG"/app.pid
 # Reap orphaned upstream children. Node does not kill its stdio children on
 # exit, so every restart otherwise strands the previous run's backends. Left
 # alone they accumulate (125 seen after one afternoon of restarts) and any

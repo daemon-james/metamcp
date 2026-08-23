@@ -61,6 +61,26 @@ import { parseToolName } from "./tool-name-parser";
 import { toolsSyncCache } from "./tools-sync-cache";
 import { sanitizeName } from "./utils";
 
+// Ceiling for a single backend's share of a list fan-out, separate from
+// MCP_TIMEOUT.
+//
+// MCP_TIMEOUT (60s by default) is sized for tools/CALL, where a slow tool is
+// doing real work and waiting is correct. Discovery is the opposite: the
+// client is blocked on the whole namespace, and its own budget is much
+// shorter — Claude Code gives tool discovery about 30 seconds. Measured
+// 2026-08-23 on the testrig, one backend that accepts the connection and never
+// answers tools/list held the response for 60.4s and every healthy backend's
+// tools with it. Correct content, delivered after the client had given up.
+//
+// A backend that cannot list its tools in 15s is unresponsive for discovery
+// purposes. Dropping it into the existing DEGRADED reporting beats making the
+// other fourteen wait. Lower this if a client's budget is tighter still; raise
+// it only if some backend genuinely needs longer to enumerate.
+const LIST_TIMEOUT_CEILING_MS = (() => {
+  const parsed = parseInt(process.env.MCP_LIST_TIMEOUT || "", 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 15_000;
+})();
+
 async function getListRequestOptions(): Promise<RequestOptions> {
   const [resetTimeoutOnProgress, timeout, maxTotalTimeout] = await Promise.all([
     configService.getMcpResetTimeoutOnProgress(),
@@ -68,10 +88,16 @@ async function getListRequestOptions(): Promise<RequestOptions> {
     configService.getMcpMaxTotalTimeout(),
   ]);
 
+  const listBound = Math.min(
+    timeout,
+    maxTotalTimeout,
+    LIST_TIMEOUT_CEILING_MS,
+  );
+
   return {
     resetTimeoutOnProgress,
-    timeout: Math.min(timeout, maxTotalTimeout),
-    maxTotalTimeout,
+    timeout: listBound,
+    maxTotalTimeout: listBound,
   };
 }
 
