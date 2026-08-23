@@ -6,6 +6,9 @@ export interface SessionLifetimeManager<T> {
   addSession(sessionId: string, session: T): void;
   removeSession(sessionId: string): void;
   getSession(sessionId: string): T | undefined;
+  touchSession(sessionId: string): boolean;
+  beginRequest(sessionId: string): boolean;
+  endRequest(sessionId: string): void;
   getAllSessions(): Map<string, T>;
   getSessionAge(sessionId: string): number | undefined;
   isSessionExpired(sessionId: string): Promise<boolean>;
@@ -24,6 +27,7 @@ export class SessionLifetimeManagerImpl<
 > implements SessionLifetimeManager<T> {
   private sessions: Map<string, T> = new Map();
   private sessionTimestamps: Map<string, number> = new Map();
+  private inFlightRequests: Map<string, number> = new Map();
   private cleanupTimer: NodeJS.Timeout | null = null;
   private readonly name: string;
 
@@ -39,10 +43,44 @@ export class SessionLifetimeManagerImpl<
   removeSession(sessionId: string): void {
     this.sessions.delete(sessionId);
     this.sessionTimestamps.delete(sessionId);
+    this.inFlightRequests.delete(sessionId);
   }
 
   getSession(sessionId: string): T | undefined {
-    return this.sessions.get(sessionId);
+    const session = this.sessions.get(sessionId);
+    if (session) {
+      this.touchSession(sessionId);
+    }
+    return session;
+  }
+
+  touchSession(sessionId: string): boolean {
+    if (!this.sessions.has(sessionId)) {
+      return false;
+    }
+    this.sessionTimestamps.set(sessionId, Date.now());
+    return true;
+  }
+
+  beginRequest(sessionId: string): boolean {
+    if (!this.touchSession(sessionId)) {
+      return false;
+    }
+    const requestCount = this.inFlightRequests.get(sessionId) ?? 0;
+    this.inFlightRequests.set(sessionId, requestCount + 1);
+    return true;
+  }
+
+  endRequest(sessionId: string): void {
+    const requestCount = this.inFlightRequests.get(sessionId);
+    if (requestCount === undefined) {
+      return;
+    }
+    if (requestCount <= 1) {
+      this.inFlightRequests.delete(sessionId);
+      return;
+    }
+    this.inFlightRequests.set(sessionId, requestCount - 1);
   }
 
   getAllSessions(): Map<string, T> {
@@ -51,7 +89,7 @@ export class SessionLifetimeManagerImpl<
 
   getSessionAge(sessionId: string): number | undefined {
     const timestamp = this.sessionTimestamps.get(sessionId);
-    return timestamp ? Date.now() - timestamp : undefined;
+    return timestamp === undefined ? undefined : Date.now() - timestamp;
   }
 
   async isSessionExpired(sessionId: string): Promise<boolean> {
@@ -71,21 +109,23 @@ export class SessionLifetimeManagerImpl<
     try {
       const sessionLifetime = await configService.getSessionLifetime();
 
-      // If session lifetime is null, sessions are infinite - skip cleanup
-      if (sessionLifetime === null) {
-        return;
-      }
-
       const now = Date.now();
       const expiredSessions: Array<{ sessionId: string; session: T }> = [];
 
       // Find expired sessions
       for (const [sessionId, timestamp] of this.sessionTimestamps.entries()) {
-        if (now - timestamp > sessionLifetime) {
-          const session = this.sessions.get(sessionId);
-          if (session) {
-            expiredSessions.push({ sessionId, session });
-          }
+        const session = this.sessions.get(sessionId);
+        if (!session) {
+          this.sessionTimestamps.delete(sessionId);
+          this.inFlightRequests.delete(sessionId);
+          continue;
+        }
+        if (
+          sessionLifetime !== null &&
+          now - timestamp > sessionLifetime &&
+          !this.inFlightRequests.has(sessionId)
+        ) {
+          expiredSessions.push({ sessionId, session });
         }
       }
 

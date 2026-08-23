@@ -44,8 +44,11 @@ export class MetaMcpServerPool {
   // Mapping: sessionId -> namespaceUuid for cleanup tracking
   private sessionToNamespace: Record<string, string> = {};
 
-  // Session creation timestamps: sessionId -> timestamp
+  // Session activity timestamps: sessionId -> timestamp
   private sessionTimestamps: Record<string, number> = {};
+
+  // Requests currently using each active session
+  private inFlightRequests: Record<string, number> = {};
 
   // Track ongoing idle server creation to prevent duplicates
   private creatingIdleServers: Set<string> = new Set();
@@ -91,6 +94,7 @@ export class MetaMcpServerPool {
   ): Promise<MetaMcpServerInstance | undefined> {
     // Check if we already have an active server for this sessionId
     if (this.activeServers[sessionId]) {
+      this.touchSession(sessionId);
       return this.activeServers[sessionId];
     }
 
@@ -349,6 +353,7 @@ export class MetaMcpServerPool {
 
     // Clean up session timestamp
     delete this.sessionTimestamps[sessionId];
+    delete this.inFlightRequests[sessionId];
 
     // Get the namespace UUID and create a new idle server if needed.
     // Skip idle replenishment for namespaces that require forwarded headers
@@ -390,6 +395,7 @@ export class MetaMcpServerPool {
     this.activeServers = {};
     this.sessionToNamespace = {};
     this.sessionTimestamps = {};
+    this.inFlightRequests = {};
     this.creatingIdleServers.clear();
     this.needsFreshServerCache = {};
 
@@ -422,6 +428,35 @@ export class MetaMcpServerPool {
    */
   getServerInstance(sessionId: string): MetaMcpServerInstance | undefined {
     return this.activeServers[sessionId];
+  }
+
+  touchSession(sessionId: string): boolean {
+    if (!this.activeServers[sessionId]) {
+      return false;
+    }
+    this.sessionTimestamps[sessionId] = Date.now();
+    return true;
+  }
+
+  beginRequest(sessionId: string): boolean {
+    if (!this.touchSession(sessionId)) {
+      return false;
+    }
+    this.inFlightRequests[sessionId] =
+      (this.inFlightRequests[sessionId] ?? 0) + 1;
+    return true;
+  }
+
+  endRequest(sessionId: string): void {
+    const requestCount = this.inFlightRequests[sessionId];
+    if (requestCount === undefined) {
+      return;
+    }
+    if (requestCount <= 1) {
+      delete this.inFlightRequests[sessionId];
+      return;
+    }
+    this.inFlightRequests[sessionId] = requestCount - 1;
   }
 
   /**
@@ -549,6 +584,7 @@ export class MetaMcpServerPool {
 
     // Check if we already have an active server for this OpenAPI session
     if (this.activeServers[sessionId]) {
+      this.touchSession(sessionId);
       return this.activeServers[sessionId];
     }
 
@@ -656,11 +692,6 @@ export class MetaMcpServerPool {
     try {
       const sessionLifetime = await configService.getSessionLifetime();
 
-      // If session lifetime is null, sessions are infinite - skip cleanup
-      if (sessionLifetime === null) {
-        return;
-      }
-
       const now = Date.now();
       const expiredSessionIds: string[] = [];
 
@@ -668,7 +699,16 @@ export class MetaMcpServerPool {
       for (const [sessionId, timestamp] of Object.entries(
         this.sessionTimestamps,
       )) {
-        if (now - timestamp > sessionLifetime) {
+        if (!this.activeServers[sessionId]) {
+          delete this.sessionTimestamps[sessionId];
+          delete this.inFlightRequests[sessionId];
+          continue;
+        }
+        if (
+          sessionLifetime !== null &&
+          now - timestamp > sessionLifetime &&
+          this.inFlightRequests[sessionId] === undefined
+        ) {
           expiredSessionIds.push(sessionId);
         }
       }
@@ -693,7 +733,7 @@ export class MetaMcpServerPool {
    */
   getSessionAge(sessionId: string): number | undefined {
     const timestamp = this.sessionTimestamps[sessionId];
-    return timestamp ? Date.now() - timestamp : undefined;
+    return timestamp === undefined ? undefined : Date.now() - timestamp;
   }
 
   /**
