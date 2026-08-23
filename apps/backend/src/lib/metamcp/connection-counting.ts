@@ -7,6 +7,8 @@ export interface ConnectionCountQuery {
   idleSessions: Record<string, ConnectedClient>;
   /** Server UUIDs with an idle connection currently being created. */
   creatingIdleSessions: Set<string>;
+  /** Active connection attempts in flight for each server UUID. */
+  creatingActiveConnections: Map<string, Set<Promise<void>>>;
 }
 
 /**
@@ -35,6 +37,7 @@ export function countConnectionsForServer({
   activeSessions,
   idleSessions,
   creatingIdleSessions,
+  creatingActiveConnections,
   serverUuid,
 }: ConnectionCountQuery & { serverUuid: string }): number {
   const distinct = new Set<ConnectedClient>();
@@ -51,20 +54,26 @@ export function countConnectionsForServer({
     }
   }
 
-  // A pending creation has no client object yet, so it can't be deduplicated —
-  // reserve a slot for it so concurrent callers don't all race past the cap.
-  return distinct.size + (creatingIdleSessions.has(serverUuid) ? 1 : 0);
+  // A pending creation has no client object yet, so it can't be deduplicated.
+  // Reserve a slot for each attempt so concurrent callers cannot race past the
+  // cap before their clients enter activeSessions.
+  return (
+    distinct.size +
+    (creatingIdleSessions.has(serverUuid) ? 1 : 0) +
+    (creatingActiveConnections.get(serverUuid)?.size ?? 0)
+  );
 }
 
 /**
  * Total distinct upstream connections across every backend, idle and active,
- * plus idle creations still in flight. Same identity rule as
+ * plus connection attempts still in flight. Same identity rule as
  * `countConnectionsForServer`.
  */
 export function countTotalConnections({
   activeSessions,
   idleSessions,
   creatingIdleSessions,
+  creatingActiveConnections,
 }: ConnectionCountQuery): number {
   const distinct = new Set<ConnectedClient>();
 
@@ -78,5 +87,10 @@ export function countTotalConnections({
     }
   }
 
-  return distinct.size + creatingIdleSessions.size;
+  let activeAttempts = 0;
+  for (const attempts of creatingActiveConnections.values()) {
+    activeAttempts += attempts.size;
+  }
+
+  return distinct.size + creatingIdleSessions.size + activeAttempts;
 }
