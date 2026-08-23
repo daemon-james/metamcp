@@ -111,6 +111,7 @@ export class OAuthSessionsRepository {
           tokens_issued_at: sql`NOW()`,
         }),
         ...(input.code_verifier && { code_verifier: input.code_verifier }),
+        ...(input.expected_state && { expected_state: input.expected_state }),
       })
       .onConflictDoUpdate({
         target: oauthSessionsTable.mcp_server_uuid,
@@ -123,6 +124,13 @@ export class OAuthSessionsRepository {
             tokens_issued_at: sql`NOW()`,
           }),
           ...(input.code_verifier && { code_verifier: input.code_verifier }),
+          // `expected_state` was accepted by this method's input type and
+          // forwarded by oauth.impl.ts, but never written. The column stayed
+          // NULL, and exchangeToken reads NULL as "flow predates this column"
+          // and skips validation, so the RFC 6749 10.12 CSRF check was off for
+          // every flow. `clearExpectedState()` remains the only path that
+          // writes NULL, since a truthy spread cannot.
+          ...(input.expected_state && { expected_state: input.expected_state }),
           updated_at: sql`NOW()`,
         },
       })

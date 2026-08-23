@@ -1,4 +1,7 @@
-import { OAuthClientProvider } from "@modelcontextprotocol/sdk/client/auth.js";
+import {
+  OAuthClientProvider,
+  type OAuthDiscoveryState,
+} from "@modelcontextprotocol/sdk/client/auth.js";
 import {
   OAuthClientInformation,
   OAuthClientInformationSchema,
@@ -217,6 +220,40 @@ class DbOAuthClientProvider implements OAuthClientProvider {
     window.location.href = authorizationUrl.href;
   }
 
+  // Server-side discovery so auth() does not fetch well-known documents
+  // from the browser. Plecto (and similar Django OAuth hosts) publish
+  // authorization_endpoint at /oauth/authorize/ but omit CORS on
+  // /.well-known/*; the SDK then falls back to {origin}/authorize → 404.
+  async discoveryState(): Promise<OAuthDiscoveryState | undefined> {
+    if (!(await this.serverExists())) return undefined;
+    try {
+      const result = await vanillaTrpcClient.frontend.oauth.discover.query({
+        mcp_server_uuid: this.mcpServerUuid,
+      });
+      if (!result.success) {
+        console.error(
+          "Server-side OAuth discovery failed:",
+          result.error,
+          result.error_description,
+        );
+        return undefined;
+      }
+      // Upstream AS metadata is RFC 8414 (authorization_endpoint required).
+      // The SDK's AuthorizationServerMetadata type is the OIDC document
+      // (jwks_uri, subject_types_supported, …). Cast: auth() only reads
+      // authorization_endpoint / response_types_supported / PKCE methods.
+      return {
+        authorizationServerUrl: result.data.authorizationServerUrl,
+        resourceMetadataUrl: result.data.resourceMetadataUrl,
+        resourceMetadata: result.data.resourceMetadata,
+        authorizationServerMetadata: result.data.authorizationServerMetadata,
+      } as OAuthDiscoveryState;
+    } catch (error) {
+      console.error("Error retrieving OAuth discovery state:", error);
+      return undefined;
+    }
+  }
+
   // RFC 6749 §10.12 CSRF defence: generate a per-flow random `state`, persist
   // it server-side (`oauth_sessions.expected_state`), and return it for
   // inclusion in the upstream's /authorize URL. The SDK invokes this once
@@ -279,11 +316,34 @@ class DbOAuthClientProvider implements OAuthClientProvider {
   }
 
   async codeVerifier() {
-    // Check if server exists in the database
-    const exists = await this.serverExists();
+    // sessionStorage FIRST, database second.
+    //
+    // A PKCE verifier is single-use and belongs to one authorize attempt.
+    // sessionStorage holds the one `saveCodeVerifier` just wrote for the flow
+    // in progress; the database row holds whatever survived the last flow.
+    // Reading the database first meant a stale row silently won.
+    //
+    // Stripe, 2026-08-23: the row's `updated_at` was five days old because
+    // `saveCodeVerifier`'s database write had failed into a catch that only
+    // logs. This method then returned that five-day-old verifier for a
+    // freshly-issued code and the exchange died on `invalid_grant / Invalid
+    // code_verifier`, pointing at the token endpoint rather than at the write
+    // that never landed.
+    //
+    // When the write does land the two agree, so preferring sessionStorage
+    // costs nothing and removes the failure mode. The database stays as the
+    // fallback for a callback that lands without the originating tab's
+    // storage.
+    const key = getServerSpecificKey(
+      SESSION_KEYS.CODE_VERIFIER,
+      this.serverUrl,
+    );
+    const inFlight = sessionStorage.getItem(key);
+    if (inFlight) {
+      return inFlight;
+    }
 
-    if (exists) {
-      // Get from database if server exists
+    if (await this.serverExists()) {
       try {
         const result = await vanillaTrpcClient.frontend.oauth.get.query({
           mcp_server_uuid: this.mcpServerUuid,
@@ -296,17 +356,7 @@ class DbOAuthClientProvider implements OAuthClientProvider {
       }
     }
 
-    // Get from session storage during OAuth flow
-    const key = getServerSpecificKey(
-      SESSION_KEYS.CODE_VERIFIER,
-      this.serverUrl,
-    );
-    const codeVerifier = sessionStorage.getItem(key);
-    if (!codeVerifier) {
-      throw new Error("No code verifier saved for session");
-    }
-
-    return codeVerifier;
+    throw new Error("No code verifier saved for session");
   }
 
   clear() {

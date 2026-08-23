@@ -4,7 +4,13 @@
 # docker build against production.
 RIG="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 set -euo pipefail
-cd /home/dev/projects/metamcp/apps/backend
+# Which checkout to run. Defaults to the main one; point METAMCP_REPO at a
+# fleet worktree to measure that branch's edits without merging first.
+# Note the backend hardcodes app.listen(12009), so only ONE instance can run at
+# a time whichever checkout it comes from. Two agents racing for that port is
+# how a stale process silently served an entire fault matrix on 2026-08-23.
+REPO="${METAMCP_REPO:-/home/dev/projects/metamcp}"
+cd "$REPO/apps/backend"
 # Kill by PORT, not just by pid file. A backend started outside this script
 # (a raw nohup, a crashed run whose pid file was overwritten) keeps :12009 and
 # silently serves every probe, so the rig measures code you are not editing.

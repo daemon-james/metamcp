@@ -56,6 +56,7 @@ vi.mock("../../index", () => {
                     client_information: values.client_information ?? {},
                     tokens: values.tokens ?? null,
                     code_verifier: values.code_verifier ?? null,
+                    expected_state: values.expected_state ?? null,
                     created_at: now,
                     updated_at: now,
                   };
@@ -83,6 +84,40 @@ describe("OAuthSessionsRepository.upsert", () => {
     valuesCalls.length = 0;
     onConflictSetCalls.length = 0;
     onConflictTargetCalls.length = 0;
+  });
+
+  it("persists expected_state on insert and on conflict", async () => {
+    // oauth.impl.ts forwards expected_state into this method and its own test
+    // pins that forwarding. Nothing asserted the repo actually WROTE it, so it
+    // was dropped here and the column stayed NULL. exchangeToken treats NULL as
+    // "flow predates the column" and takes its back-compat bypass, which turns
+    // the RFC 6749 10.12 CSRF check off silently for every flow.
+    const fresh = await repo.upsert({
+      mcp_server_uuid: serverId,
+      expected_state: "state-one",
+    });
+    expect(fresh.expected_state).toBe("state-one");
+    expect(valuesCalls[0].expected_state).toBe("state-one");
+
+    const second = await repo.upsert({
+      mcp_server_uuid: serverId,
+      expected_state: "state-two",
+    });
+    expect(second.expected_state).toBe("state-two");
+    expect(onConflictSetCalls[1].expected_state).toBe("state-two");
+  });
+
+  it("a partial upsert does not clear an existing expected_state", async () => {
+    await repo.upsert({
+      mcp_server_uuid: serverId,
+      expected_state: "state-one",
+    });
+    const after = await repo.upsert({
+      mcp_server_uuid: serverId,
+      tokens: { access_token: "AT", token_type: "Bearer" } as OAuthTokens,
+    });
+    expect(after.expected_state).toBe("state-one");
+    expect(onConflictSetCalls[1].expected_state).toBeUndefined();
   });
 
   it("uses a single ON CONFLICT statement (not check-then-insert)", async () => {
