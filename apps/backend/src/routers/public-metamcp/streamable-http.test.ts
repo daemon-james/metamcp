@@ -112,6 +112,27 @@ function makeRequest(body: unknown): Record<string, unknown> {
   };
 }
 
+// Production shape. index.ts skips express.json() for /metamcp/, so `body` is
+// undefined and the payload only exists on the request stream. Every test that
+// sets `body` directly is testing a request the server never receives, which is
+// how a guard that rejected EVERY session-less POST shipped green.
+function makeStreamRequest(payload: unknown): Record<string, unknown> {
+  const raw = Buffer.from(JSON.stringify(payload), "utf8");
+  return {
+    body: undefined,
+    headers: {
+      accept: "application/json, text/event-stream",
+    },
+    namespaceUuid: "namespace-1",
+    endpointName: "endpoint-1",
+    endpoint: {},
+    authMethod: "api-key",
+    async *[Symbol.asyncIterator]() {
+      yield raw;
+    },
+  };
+}
+
 function makeResponse() {
   const response = {
     statusCode: 200,
@@ -155,6 +176,51 @@ describe("public Streamable HTTP session creation", () => {
 
     await postHandler(
       makeRequest({
+        jsonrpc: "2.0",
+        method: "notifications/initialized",
+      }),
+      response,
+    );
+
+    expect(response.statusCode).toBe(400);
+    expect(sessionManager.getSessionIds()).toEqual(initialSessionIds);
+    expect(mocks.getServer).not.toHaveBeenCalled();
+    expect(mocks.transports).toHaveLength(0);
+  });
+
+  it("accepts a stream-delivered initialize request (body undefined)", async () => {
+    // The regression: isInitializeRequest(req.body) was tested against a value
+    // these routes never populate, so a real initialize was answered 400 and no
+    // client could open a session. The rig showed 8 of 8 sessions with 0 tools.
+    const connect = vi.fn().mockResolvedValue(undefined);
+    mocks.getServer.mockResolvedValue({ server: { connect } });
+    const response = makeResponse();
+
+    await postHandler(
+      makeStreamRequest({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: {
+          protocolVersion: "2025-11-25",
+          capabilities: {},
+          clientInfo: { name: "test-client", version: "1.0.0" },
+        },
+      }),
+      response,
+    );
+
+    expect(response.statusCode).not.toBe(400);
+    expect(mocks.getServer).toHaveBeenCalledOnce();
+    expect(mocks.transports).toHaveLength(1);
+  });
+
+  it("still rejects a stream-delivered notification", async () => {
+    const initialSessionIds = sessionManager.getSessionIds();
+    const response = makeResponse();
+
+    await postHandler(
+      makeStreamRequest({
         jsonrpc: "2.0",
         method: "notifications/initialized",
       }),
