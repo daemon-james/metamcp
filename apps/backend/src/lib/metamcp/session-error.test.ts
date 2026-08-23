@@ -84,6 +84,33 @@ describe("isBackendSessionLostError", () => {
     expect(isBackendSessionLostError(error)).toBe(true);
   });
 
+  it("does not classify the SDK -32001 request timeout as session loss", () => {
+    const error = Object.assign(
+      new Error("MCP error -32001: Request timed out"),
+      { code: -32001 },
+    );
+
+    expect(isBackendSessionLostError(error)).toBe(false);
+  });
+
+  it("classifies -32001 with a Session not found message as session loss", () => {
+    const error = Object.assign(
+      new Error("MCP error -32001: Session not found"),
+      { code: -32001 },
+    );
+
+    expect(isBackendSessionLostError(error)).toBe(true);
+  });
+
+  it("classifies -32001 with HTTP status 404 as session loss", () => {
+    const error = Object.assign(new Error("MCP error -32001: Request failed"), {
+      code: -32001,
+      status: 404,
+    });
+
+    expect(isBackendSessionLostError(error)).toBe(true);
+  });
+
   it("falls back to String(error) for objects with only toString()", () => {
     class CustomThrowable {
       toString() {

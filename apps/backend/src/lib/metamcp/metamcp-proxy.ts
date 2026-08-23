@@ -56,10 +56,36 @@ import {
   createToolOverridesListToolsMiddleware,
   mapOverrideNameToOriginal,
 } from "./metamcp-middleware/tool-overrides.functional";
-import { isRecoverableBackendError } from "./session-error";
+import { isSafeToReplayToolCallError } from "./session-error";
 import { parseToolName } from "./tool-name-parser";
 import { toolsSyncCache } from "./tools-sync-cache";
 import { sanitizeName } from "./utils";
+
+async function getListRequestOptions(): Promise<RequestOptions> {
+  const [resetTimeoutOnProgress, timeout, maxTotalTimeout] = await Promise.all([
+    configService.getMcpResetTimeoutOnProgress(),
+    configService.getMcpTimeout(),
+    configService.getMcpMaxTotalTimeout(),
+  ]);
+
+  return {
+    resetTimeoutOnProgress,
+    timeout: Math.min(timeout, maxTotalTimeout),
+    maxTotalTimeout,
+  };
+}
+
+function getRemainingListRequestOptions(
+  options: RequestOptions,
+  deadline: number,
+): RequestOptions {
+  const remaining = Math.max(1, Math.ceil(deadline - performance.now()));
+  return {
+    ...options,
+    timeout: Math.min(options.timeout as number, remaining),
+    maxTotalTimeout: Math.min(options.maxTotalTimeout as number, remaining),
+  };
+}
 
 /**
  * Filter out tools that are overrides of existing tools to prevent duplicates in database
@@ -183,6 +209,7 @@ export const createServer = async (
       context.namespaceUuid,
       includeInactiveServers,
     );
+    const listRequestOptions = await getListRequestOptions();
 
     // Extract forwarded headers from client request for servers that need them
     const forwardedHeadersByServer = context.clientRequestHeaders
@@ -300,6 +327,8 @@ export const createServer = async (
 
         try {
           const toolFetchStart = performance.now();
+          const toolListDeadline =
+            performance.now() + (listRequestOptions.maxTotalTimeout as number);
 
           // Paginated tool discovery - load all pages automatically
           const fetchAllToolPages = async (
@@ -319,6 +348,10 @@ export const createServer = async (
                   },
                 },
                 ListToolsResultSchema,
+                getRemainingListRequestOptions(
+                  listRequestOptions,
+                  toolListDeadline,
+                ),
               );
 
               if (result.tools && result.tools.length > 0) {
@@ -458,6 +491,7 @@ export const createServer = async (
           namespaceUuid,
           includeInactiveServers,
         );
+        const listRequestOptions = await getListRequestOptions();
 
         // Extract forwarded headers for dynamic tool routing
         const forwardedHeadersByServer = context.clientRequestHeaders
@@ -496,6 +530,9 @@ export const createServer = async (
               params.name || session.client.getServerVersion()?.name || "";
 
             if (sanitizeName(serverName) === serverPrefix) {
+              const toolListDeadline =
+                performance.now() +
+                (listRequestOptions.maxTotalTimeout as number);
               // Found the server, now check if it has this tool with pagination
               try {
                 // Paginate this server's catalogue looking for the tool. Wrapped
@@ -529,6 +566,10 @@ export const createServer = async (
                             params: { cursor: cursor },
                           },
                           ListToolsResultSchema,
+                          getRemainingListRequestOptions(
+                            listRequestOptions,
+                            toolListDeadline,
+                          ),
                         );
 
                       if (
@@ -610,16 +651,10 @@ export const createServer = async (
     try {
       return (await callOnce(clientForTool)) as CallToolResult;
     } catch (error) {
-      // Must be the WIDE predicate. `isBackendSessionLostError` only matches the
-      // backend's "Session not found" / HTTP 404 envelope; it does NOT match the
-      // SDK's bare `Error: Not connected`, which is what a locally torn-down
-      // transport throws — and that is the overwhelmingly common case (a sibling
-      // session's cleanup released a shared connection, a stdio child was
-      // SIGTERMed, the backend container restarted). Production 2026-08-13: 5
-      // "Not connected" tool-call failures, 0 recovery attempts, because they all
-      // fell through this guard to the rethrow below. The sibling list path
-      // (list-handler-recovery.ts) has always used the wide predicate.
-      if (!isRecoverableBackendError(error)) {
+      // A timeout does not prove whether the backend ran the tool. Replay only
+      // when the backend lost the session or the local transport was already
+      // disconnected. List reads use a wider policy because they are idempotent.
+      if (!isSafeToReplayToolCallError(error)) {
         logger.error(
           `Error calling tool "${name}" through ${
             clientForTool.client.getServerVersion()?.name || "unknown"
@@ -779,6 +814,7 @@ export const createServer = async (
       namespaceUuid,
       includeInactiveServers,
     );
+    const listRequestOptions = await getListRequestOptions();
     const allPrompts: ListPromptsResult["prompts"] = [];
     const failedServers: string[] = [];
 
@@ -884,6 +920,7 @@ export const createServer = async (
                   },
                 },
                 ListPromptsResultSchema,
+                listRequestOptions,
               ),
             onFreshSession: (fresh) => {
               activeSession = fresh;
@@ -927,6 +964,7 @@ export const createServer = async (
       namespaceUuid,
       includeInactiveServers,
     );
+    const listRequestOptions = await getListRequestOptions();
     const allResources: ListResourcesResult["resources"] = [];
     const failedServers: string[] = [];
 
@@ -1032,6 +1070,7 @@ export const createServer = async (
                   },
                 },
                 ListResourcesResultSchema,
+                listRequestOptions,
               ),
             onFreshSession: (fresh) => {
               activeSession = fresh;
@@ -1106,6 +1145,7 @@ export const createServer = async (
         namespaceUuid,
         includeInactiveServers,
       );
+      const listRequestOptions = await getListRequestOptions();
       const allTemplates: ResourceTemplate[] = [];
       const failedServers: string[] = [];
 
@@ -1213,6 +1253,7 @@ export const createServer = async (
                     },
                   },
                   ListResourceTemplatesResultSchema,
+                  listRequestOptions,
                 ),
             });
 
