@@ -26,7 +26,14 @@ import { oauthSessionsRepository } from "../../db/repositories";
 import logger from "../../utils/logger";
 import { resolveAuthorizationServer } from "./discovery";
 import {
+  isRefreshTokenKnownDead,
+  isTerminalRefreshError,
+  markRefreshTokenDead,
+} from "./terminal-refresh-error";
+import {
   canonicalResourceUri,
+  getConfiguredMcpTimeout,
+  OAuthRequestTimeoutError,
   OAuthTokens,
   redactToken,
   refreshAccessToken,
@@ -34,11 +41,6 @@ import {
   resolveTokenEndpointAuthMethod,
   UpstreamTokenError,
 } from "./token-exchange";
-import {
-  isRefreshTokenKnownDead,
-  isTerminalRefreshError,
-  markRefreshTokenDead,
-} from "./terminal-refresh-error";
 import { checkTokenExpiry, DEFAULT_REFRESH_SKEW_SECONDS } from "./token-expiry";
 
 export interface RefreshResult {
@@ -78,9 +80,27 @@ export async function tryRefreshUpstreamTokens(
     return inFlight;
   }
   const promise = (async () => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      return await doRefresh(serverParams);
+      const timeoutMs = await getConfiguredMcpTimeout();
+      const timeoutError = new OAuthRequestTimeoutError(timeoutMs);
+      const controller = new AbortController();
+      const deadline = new Promise<RefreshResult>((resolve) => {
+        timer = setTimeout(() => {
+          controller.abort(timeoutError);
+          resolve({
+            status: "failed",
+            error: "refresh_timeout",
+            errorDescription: timeoutError.message,
+          });
+        }, timeoutMs);
+      });
+      return await Promise.race([
+        doRefresh(serverParams, controller.signal),
+        deadline,
+      ]);
     } finally {
+      if (timer) clearTimeout(timer);
       inFlightRefreshes.delete(serverParams.uuid);
     }
   })();
@@ -90,6 +110,7 @@ export async function tryRefreshUpstreamTokens(
 
 async function doRefresh(
   serverParams: Pick<ServerParameters, "uuid" | "name" | "url">,
+  signal: AbortSignal,
 ): Promise<RefreshResult> {
   if (!serverParams.url) {
     return { status: "no_session" };
@@ -142,7 +163,9 @@ async function doRefresh(
   // Full discovery chain: protected-resource metadata names the issuer, whose
   // own metadata carries the token endpoint. Falls back to the MCP server's
   // origin for servers that host their own endpoints.
-  const resolved = await resolveAuthorizationServer(serverParams.url);
+  const resolved = await resolveAuthorizationServer(serverParams.url, {
+    signal,
+  });
   const discovered = resolved.metadata;
   const tokenEndpoint = resolveTokenEndpoint({
     clientInformation,
@@ -177,6 +200,7 @@ async function doRefresh(
       // Prefer the identifier the resource publishes for itself; the
       // authorization server matches against that exact string.
       resource: resolved.resource ?? canonicalResourceUri(serverParams.url),
+      signal,
     });
   } catch (error) {
     if (error instanceof UpstreamTokenError) {

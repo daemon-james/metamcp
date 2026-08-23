@@ -22,6 +22,7 @@ import {
 } from "./discovery-urls";
 import {
   discoverAuthorizationServerMetadata,
+  fetchWithOAuthDeadline,
   OAuthAuthorizationServerMetadata,
 } from "./token-exchange";
 
@@ -49,12 +50,18 @@ export interface ResolvedAuthorizationServer {
 async function fetchJsonObject(
   url: URL | string,
   fetchImpl: typeof fetch,
+  signal?: AbortSignal,
 ): Promise<Record<string, unknown> | null> {
   let response: Response;
   try {
-    response = await fetchImpl(url, {
-      headers: { Accept: "application/json" },
-    });
+    response = await fetchWithOAuthDeadline(
+      url,
+      {
+        headers: { Accept: "application/json" },
+        signal,
+      },
+      fetchImpl,
+    );
   } catch (error) {
     logger.debug(
       `OAuth discovery: ${String(url)} unreachable: ${
@@ -96,6 +103,7 @@ export async function discoverProtectedResourceMetadata(
   options: {
     fetchImpl?: typeof fetch;
     resourceMetadataUrl?: string | null;
+    signal?: AbortSignal;
   } = {},
 ): Promise<ProtectedResourceMetadata | null> {
   const fetchImpl = options.fetchImpl ?? fetch;
@@ -104,7 +112,7 @@ export async function discoverProtectedResourceMetadata(
     : buildProtectedResourceMetadataUrls(serverUrl);
 
   for (const candidate of candidates) {
-    const data = await fetchJsonObject(candidate, fetchImpl);
+    const data = await fetchJsonObject(candidate, fetchImpl, options.signal);
     if (!data) continue;
     return {
       resource: typeof data.resource === "string" ? data.resource : undefined,
@@ -127,6 +135,7 @@ export async function resolveAuthorizationServer(
   options: {
     fetchImpl?: typeof fetch;
     resourceMetadataUrl?: string | null;
+    signal?: AbortSignal;
   } = {},
 ): Promise<ResolvedAuthorizationServer> {
   const fetchImpl = options.fetchImpl ?? fetch;
@@ -153,7 +162,7 @@ export async function resolveAuthorizationServer(
 
   for (const issuer of prm?.authorization_servers ?? []) {
     for (const candidate of buildAuthorizationServerMetadataUrls(issuer)) {
-      const data = await fetchJsonObject(candidate, fetchImpl);
+      const data = await fetchJsonObject(candidate, fetchImpl, options.signal);
       if (!data) continue;
 
       if (!issuerMatches(issuer, data.issuer as string | undefined)) {
@@ -189,6 +198,7 @@ export async function resolveAuthorizationServer(
     const legacy = await discoverAuthorizationServerMetadata(
       serverUrl,
       fetchImpl,
+      options.signal,
     );
     if (legacy) {
       return {

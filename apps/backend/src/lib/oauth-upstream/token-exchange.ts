@@ -13,6 +13,18 @@
 
 import logger from "../../utils/logger";
 
+// configService uses the same value when MCP_TIMEOUT has no stored setting.
+const FALLBACK_MCP_TIMEOUT_MS = 60_000;
+
+export async function getConfiguredMcpTimeout(): Promise<number> {
+  try {
+    const { configService } = await import("../config.service");
+    return await configService.getMcpTimeout();
+  } catch {
+    return FALLBACK_MCP_TIMEOUT_MS;
+  }
+}
+
 export type TokenEndpointAuthMethod =
   | "none"
   | "client_secret_basic"
@@ -57,6 +69,56 @@ export class UpstreamTokenError extends Error {
   }
 }
 
+export class OAuthRequestTimeoutError extends Error {
+  readonly timeoutMs: number;
+
+  constructor(timeoutMs: number) {
+    super(`OAuth request timed out after ${timeoutMs}ms`);
+    this.name = "OAuthRequestTimeoutError";
+    this.timeoutMs = timeoutMs;
+  }
+}
+
+export async function fetchWithOAuthDeadline(
+  input: string | URL,
+  init: RequestInit,
+  fetchImpl: typeof fetch = fetch,
+): Promise<Response> {
+  const timeoutMs = await getConfiguredMcpTimeout();
+  const timeoutError = new OAuthRequestTimeoutError(timeoutMs);
+  const controller = new AbortController();
+  const sourceSignal = init.signal ?? undefined;
+  let rejectAbort: (reason: Error) => void = () => undefined;
+  const abortPromise = new Promise<never>((_, reject) => {
+    rejectAbort = reject;
+  });
+  const abort = (reason: unknown) => {
+    if (controller.signal.aborted) return;
+    const error =
+      reason instanceof Error ? reason : new Error("OAuth request aborted");
+    controller.abort(error);
+    rejectAbort(error);
+  };
+  const abortFromSource = () => abort(sourceSignal?.reason);
+
+  if (sourceSignal?.aborted) {
+    abortFromSource();
+  } else {
+    sourceSignal?.addEventListener("abort", abortFromSource, { once: true });
+  }
+  const timer = setTimeout(() => abort(timeoutError), timeoutMs);
+
+  try {
+    return await Promise.race([
+      fetchImpl(input, { ...init, signal: controller.signal }),
+      abortPromise,
+    ]);
+  } finally {
+    clearTimeout(timer);
+    sourceSignal?.removeEventListener("abort", abortFromSource);
+  }
+}
+
 interface PostFormInput {
   tokenEndpoint: string;
   params: URLSearchParams;
@@ -64,6 +126,7 @@ interface PostFormInput {
   clientId: string;
   clientSecret?: string;
   fetchImpl?: typeof fetch;
+  signal?: AbortSignal;
 }
 
 // Mask a token value for logs. Never log the full token.
@@ -80,6 +143,7 @@ async function postFormToToken({
   clientId,
   clientSecret,
   fetchImpl,
+  signal,
 }: PostFormInput): Promise<OAuthTokens> {
   const headers = new Headers({
     "Content-Type": "application/x-www-form-urlencoded",
@@ -104,11 +168,16 @@ async function postFormToToken({
   }
 
   const doFetch = fetchImpl ?? fetch;
-  const response = await doFetch(tokenEndpoint, {
-    method: "POST",
-    headers,
-    body: params,
-  });
+  const response = await fetchWithOAuthDeadline(
+    tokenEndpoint,
+    {
+      method: "POST",
+      headers,
+      body: params,
+      signal,
+    },
+    doFetch,
+  );
 
   let payload: unknown;
   try {
@@ -189,6 +258,7 @@ export interface ExchangeAuthorizationCodeInput {
   // Canonical URI of the MCP server the token is for (RFC 8707).
   resource?: string;
   fetchImpl?: typeof fetch;
+  signal?: AbortSignal;
 }
 
 export async function exchangeAuthorizationCode(
@@ -211,6 +281,7 @@ export async function exchangeAuthorizationCode(
     clientId: input.clientId,
     clientSecret: input.clientSecret,
     fetchImpl: input.fetchImpl,
+    signal: input.signal,
   });
 }
 
@@ -224,6 +295,7 @@ export interface RefreshAccessTokenInput {
   // Canonical URI of the MCP server the token is for (RFC 8707).
   resource?: string;
   fetchImpl?: typeof fetch;
+  signal?: AbortSignal;
 }
 
 export async function refreshAccessToken(
@@ -247,6 +319,7 @@ export async function refreshAccessToken(
     clientId: input.clientId,
     clientSecret: input.clientSecret,
     fetchImpl: input.fetchImpl,
+    signal: input.signal,
   });
 
   // RFC 6749 §6: refresh response MAY omit refresh_token, in which case the
@@ -276,6 +349,7 @@ export interface OAuthAuthorizationServerMetadata {
 export async function discoverAuthorizationServerMetadata(
   serverUrl: string,
   fetchImpl: typeof fetch = fetch,
+  signal?: AbortSignal,
 ): Promise<OAuthAuthorizationServerMetadata | null> {
   let wellKnownUrl: URL;
   try {
@@ -289,9 +363,14 @@ export async function discoverAuthorizationServerMetadata(
 
   let response: Response;
   try {
-    response = await fetchImpl(wellKnownUrl, {
-      headers: { Accept: "application/json" },
-    });
+    response = await fetchWithOAuthDeadline(
+      wellKnownUrl,
+      {
+        headers: { Accept: "application/json" },
+        signal,
+      },
+      fetchImpl,
+    );
   } catch (error) {
     logger.warn(
       `OAuth discovery failed at ${wellKnownUrl.href}: ${

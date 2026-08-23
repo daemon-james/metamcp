@@ -8,6 +8,7 @@ import { ServerParameters } from "@repo/zod-types";
 import logger from "@/utils/logger";
 
 import { oauthSessionsRepository } from "../../db/repositories";
+import { configService } from "../config.service";
 import {
   refreshIfExpiring,
   tryRefreshUpstreamTokens,
@@ -16,6 +17,7 @@ import { recoverFromPostAuthRace } from "../oauth-upstream/retry-post-auth";
 import { isUpstreamUnauthorizedError } from "../oauth-upstream/token-exchange";
 import { ProcessManagedStdioTransport } from "../stdio-transport/process-managed-transport";
 import {
+  ConnectionTimeoutError,
   describeTerminalConnectionError,
   isTerminalConnectionError,
 } from "./connection-errors";
@@ -31,6 +33,38 @@ export interface ConnectedClient {
   client: Client;
   cleanup: () => Promise<void>;
   onProcessCrash?: (exitCode: number | null, signal: string | null) => void;
+}
+
+export async function connectClientWithDeadline(
+  client: Client,
+  transport: Transport,
+  timeoutMs: number,
+): Promise<void> {
+  const timeoutError = new ConnectionTimeoutError(timeoutMs);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(timeoutError), timeoutMs);
+  });
+
+  try {
+    await Promise.race([client.connect(transport), deadline]);
+  } catch (error) {
+    if (error === timeoutError) {
+      try {
+        await transport.close();
+      } catch {
+        // The timeout is the useful error. Cleanup errors must not replace it.
+      }
+      try {
+        await client.close();
+      } catch {
+        // The client may not have finished initialization.
+      }
+    }
+    throw error;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 /**
@@ -189,6 +223,7 @@ export const connectMetaMcpClient = async (
   onProcessCrash?: (exitCode: number | null, signal: string | null) => void,
 ): Promise<ConnectedClient | undefined> => {
   const waitFor = 5000;
+  const connectTimeoutMs = await configService.getMcpTimeout();
 
   // Get max attempts from server error tracker instead of hardcoding
   const maxAttempts = await serverErrorTracker.getServerMaxAttempts(
@@ -196,6 +231,7 @@ export const connectMetaMcpClient = async (
   );
   let count = 0;
   let retry = true;
+  let refreshAttempted = false;
 
   logger.info(
     `Connecting to server ${serverParams.name} (${serverParams.uuid}) with max attempts: ${maxAttempts}`,
@@ -295,7 +331,7 @@ export const connectMetaMcpClient = async (
         };
       }
 
-      await client.connect(transport);
+      await connectClientWithDeadline(client, transport, connectTimeoutMs);
       metamcpLogStore.addLog(
         serverParams.name,
         "info",
@@ -355,7 +391,7 @@ export const connectMetaMcpClient = async (
       // does not leave orphaned resources behind. Rethrow so the caller
       // can decide whether to recover (fast retry / 401 refresh) or
       // surface the failure.
-      if (transport) {
+      if (transport && !(error instanceof ConnectionTimeoutError)) {
         try {
           await transport.close();
           console.log(
@@ -368,7 +404,7 @@ export const connectMetaMcpClient = async (
           );
         }
       }
-      if (client) {
+      if (client && !(error instanceof ConnectionTimeoutError)) {
         try {
           await client.close();
         } catch (_cleanupError) {
@@ -430,9 +466,11 @@ export const connectMetaMcpClient = async (
       //    we fall through.
       if (
         isHttpServer &&
+        !refreshAttempted &&
         serverParams.oauth_tokens?.refresh_token &&
         isUpstreamUnauthorizedError(error)
       ) {
+        refreshAttempted = true;
         try {
           const refresh = await tryRefreshUpstreamTokens(serverParams);
           if (refresh.status === "refreshed" && refresh.tokens) {

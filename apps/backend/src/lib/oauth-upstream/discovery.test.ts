@@ -1,5 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
 
+vi.mock("../config.service", () => ({
+  configService: { getMcpTimeout: vi.fn().mockResolvedValue(60_000) },
+}));
+
 import {
   discoverProtectedResourceMetadata,
   resolveAuthorizationServer,
@@ -81,6 +85,27 @@ describe("discoverProtectedResourceMetadata", () => {
 
     const prm = await discoverProtectedResourceMetadata(MCP, { fetchImpl });
     expect(prm?.authorization_servers).toEqual(["https://auth.example.com"]);
+  });
+
+  it("bounds a discovery fetch that never settles", async () => {
+    const { configService } = await import("../config.service");
+    vi.mocked(configService.getMcpTimeout).mockResolvedValueOnce(20);
+    let signal: AbortSignal | null | undefined;
+    const fetchImpl = vi.fn<FetchImpl>((_url, init) => {
+      signal = init?.signal;
+      return new Promise<Response>(() => undefined);
+    });
+
+    const startedAt = Date.now();
+    const result = await discoverProtectedResourceMetadata(MCP, {
+      fetchImpl,
+      resourceMetadataUrl: "https://auth.example.com/stalled-metadata",
+    });
+
+    expect(result).toBeNull();
+    expect(Date.now() - startedAt).toBeLessThan(500);
+    expect(signal).toBeInstanceOf(AbortSignal);
+    expect(signal?.aborted).toBe(true);
   });
 });
 

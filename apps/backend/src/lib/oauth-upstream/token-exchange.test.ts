@@ -1,9 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+vi.mock("../config.service", () => ({
+  configService: { getMcpTimeout: vi.fn().mockResolvedValue(60_000) },
+}));
+
 import {
   discoverAuthorizationServerMetadata,
   exchangeAuthorizationCode,
   isUpstreamUnauthorizedError,
+  OAuthRequestTimeoutError,
   redactToken,
   refreshAccessToken,
   resolveTokenEndpoint,
@@ -251,6 +256,30 @@ describe("refreshAccessToken", () => {
 
     expect(err).toBeInstanceOf(UpstreamTokenError);
     expect((err as UpstreamTokenError).oauthError?.error).toBe("invalid_grant");
+  });
+
+  it("bounds a token POST that never settles", async () => {
+    const { configService } = await import("../config.service");
+    vi.mocked(configService.getMcpTimeout).mockResolvedValueOnce(20);
+    let signal: AbortSignal | null | undefined;
+    const fetchImpl = vi.fn<FetchImpl>((_url, init) => {
+      signal = init?.signal;
+      return new Promise<Response>(() => undefined);
+    });
+
+    const startedAt = Date.now();
+    const error = await refreshAccessToken({
+      tokenEndpoint: "https://example.com/token",
+      refreshToken: "RT_stalled",
+      clientId: "client-1",
+      authMethod: "none",
+      fetchImpl,
+    }).catch((caught: unknown) => caught);
+
+    expect(Date.now() - startedAt).toBeLessThan(500);
+    expect(error).toBeInstanceOf(OAuthRequestTimeoutError);
+    expect(signal).toBeInstanceOf(AbortSignal);
+    expect(signal?.aborted).toBe(true);
   });
 });
 
