@@ -1,5 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+vi.mock("../config.service", () => ({
+  configService: { getMcpTimeout: vi.fn().mockResolvedValue(60_000) },
+}));
+
 vi.mock("../../db/repositories", () => ({
   oauthSessionsRepository: {
     findByMcpServerUuid: vi.fn(),
@@ -361,5 +365,98 @@ describe("tryRefreshUpstreamTokens", () => {
     findByMcpServerUuid.mockResolvedValue(expiredSession("RT_after_reauth"));
     await mod.refreshIfExpiring(SERVER);
     expect(fetchSpy.mock.calls.length).toBeGreaterThan(callsAfterFirst);
+  });
+
+  it("times out a stalled refresh and releases the mutex", async () => {
+    const { tryRefreshUpstreamTokens, findByMcpServerUuid, upsert } =
+      await loadModule();
+    const { configService } = await import("../config.service");
+    vi.mocked(configService.getMcpTimeout).mockResolvedValue(20);
+
+    findByMcpServerUuid.mockResolvedValue({
+      mcp_server_uuid: SERVER.uuid,
+      client_information: {
+        client_id: "c1",
+        token_endpoint: "https://upstream/token",
+      },
+      tokens: {
+        access_token: "OLD",
+        token_type: "Bearer",
+        refresh_token: "RT_stalled",
+      },
+    });
+
+    let tokenPosts = 0;
+    const tokenSignals: AbortSignal[] = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation((url, init) => {
+      if (init?.method !== "POST") {
+        return Promise.resolve(new Response("", { status: 404 }));
+      }
+      expect(String(url)).toBe("https://upstream/token");
+      tokenPosts += 1;
+      if (init.signal) tokenSignals.push(init.signal);
+      return new Promise<Response>(() => undefined);
+    });
+
+    const startedAt = Date.now();
+    const first = await tryRefreshUpstreamTokens(SERVER);
+    expect(first.status).toBe("failed");
+    expect(first.status).not.toBe("needs_reauthorization");
+    expect(Date.now() - startedAt).toBeLessThan(500);
+    expect(tokenPosts).toBe(1);
+    expect(tokenSignals[0]).toBeInstanceOf(AbortSignal);
+    expect(tokenSignals[0]?.aborted).toBe(true);
+    expect(upsert).not.toHaveBeenCalled();
+
+    const second = await tryRefreshUpstreamTokens(SERVER);
+    expect(second.status).toBe("failed");
+    expect(tokenPosts).toBe(2);
+  });
+
+  it("times out the whole refresh and releases the mutex", async () => {
+    const { tryRefreshUpstreamTokens, findByMcpServerUuid, upsert } =
+      await loadModule();
+    const { configService } = await import("../config.service");
+    vi.mocked(configService.getMcpTimeout).mockResolvedValue(20);
+
+    const session = {
+      mcp_server_uuid: SERVER.uuid,
+      client_information: {
+        client_id: "c1",
+        token_endpoint: "https://upstream/token",
+      },
+      tokens: {
+        access_token: "OLD",
+        token_type: "Bearer",
+        refresh_token: "RT_stalled",
+      },
+    };
+    findByMcpServerUuid.mockReset();
+    findByMcpServerUuid
+      .mockImplementationOnce(() => new Promise(() => undefined))
+      .mockResolvedValue(session);
+    upsert.mockResolvedValue({});
+
+    let tokenPosts = 0;
+    vi.spyOn(globalThis, "fetch").mockImplementation((_url, init) => {
+      if (init?.method !== "POST") {
+        return Promise.resolve(new Response("", { status: 404 }));
+      }
+      tokenPosts += 1;
+      return Promise.resolve(
+        jsonResponse(200, {
+          access_token: "NEW",
+          token_type: "Bearer",
+        }),
+      );
+    });
+
+    const first = await tryRefreshUpstreamTokens(SERVER);
+    expect(first.status).toBe("failed");
+    expect(first.status).not.toBe("needs_reauthorization");
+
+    const second = await tryRefreshUpstreamTokens(SERVER);
+    expect(second.status).toBe("refreshed");
+    expect(tokenPosts).toBe(1);
   });
 });

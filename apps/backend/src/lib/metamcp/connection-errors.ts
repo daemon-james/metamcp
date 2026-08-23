@@ -8,6 +8,16 @@
 // failed", when the actual problem is that the two ends cannot speak a common
 // version and no amount of waiting will change it.
 
+export class ConnectionTimeoutError extends Error {
+  readonly timeoutMs: number;
+
+  constructor(timeoutMs: number) {
+    super(`MCP connection timed out after ${timeoutMs}ms`);
+    this.name = "ConnectionTimeoutError";
+    this.timeoutMs = timeoutMs;
+  }
+}
+
 /**
  * A protocol-version mismatch reported by the SDK during `initialize`.
  *
