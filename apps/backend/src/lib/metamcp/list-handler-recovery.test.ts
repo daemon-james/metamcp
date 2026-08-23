@@ -17,6 +17,11 @@ const sessionLostError = () =>
 
 const transportLostError = () => new Error("Not connected");
 
+const requestTimeoutError = () =>
+  Object.assign(new Error("MCP error -32001: Request timed out"), {
+    code: -32001,
+  });
+
 const makeSession = (label: string): ConnectedClient =>
   ({ label }) as unknown as ConnectedClient;
 
@@ -103,6 +108,22 @@ describe("requestWithSessionRecovery", () => {
     await expect(
       requestWithSessionRecovery({ ...baseOpts(pool, stale), attempt }),
     ).resolves.toBe("ok");
+    expect(pool.invalidateServerConnection).toHaveBeenCalledTimes(1);
+  });
+
+  it("retries an SDK timeout for the idempotent list request", async () => {
+    const stale = makeSession("stale");
+    const fresh = makeSession("fresh");
+    const pool = makePool(fresh);
+    const attempt = vi
+      .fn()
+      .mockRejectedValueOnce(requestTimeoutError())
+      .mockResolvedValueOnce(["tool-c"]);
+
+    await expect(
+      requestWithSessionRecovery({ ...baseOpts(pool, stale), attempt }),
+    ).resolves.toEqual(["tool-c"]);
+    expect(attempt).toHaveBeenCalledTimes(2);
     expect(pool.invalidateServerConnection).toHaveBeenCalledTimes(1);
   });
 

@@ -35,6 +35,10 @@
 const SESSION_NOT_FOUND = "Session not found";
 const HTTP_404 = "HTTP 404";
 const RPC_CODE_PATTERNS = ["-32001", "-32600"];
+const REQUEST_TIMEOUT_MARKERS = [
+  "Request timed out",
+  "Maximum total timeout exceeded",
+];
 const MAX_CAUSE_DEPTH = 8;
 
 // Transport-disconnect signal raised by the MCP TypeScript SDK's Protocol
@@ -79,29 +83,49 @@ function objectHasSessionLostCode(candidate: unknown): boolean {
   if (typeof candidate !== "object" || candidate === null) {
     return false;
   }
-  const code = (candidate as { code?: unknown }).code;
-  if (typeof code === "number") {
-    // 404 is the transport, not the RPC layer: the SDK's StreamableHTTPError
-    // puts the HTTP status on `.code`, so an expired session arrives as
-    // `code === 404`. Requiring the JSON-RPC codes alone missed it, and so did
-    // the message matcher — SDK 1.29 formats the error as
-    // "Streamable HTTP error: Error POSTing to endpoint: <body>", never
-    // interpolating the status, so the HTTP_404 substring cannot appear.
-    // Between them the detector only fired when the upstream happened to put
-    // both the literal words "Session not found" and a -32001/-32600 code in
-    // the body; a 404 with an empty, HTML, or differently-worded body went
-    // unrecovered and failed the caller's request.
-    //
-    // The spec is unambiguous that the status alone is the signal: "When a
-    // client receives HTTP 404 in response to a request containing an
-    // Mcp-Session-Id, it MUST start a new session by sending a new
-    // InitializeRequest without a session ID attached."
-    return code === -32001 || code === -32600 || code === 404;
+  const obj = candidate as {
+    code?: unknown;
+    message?: unknown;
+    status?: unknown;
+    statusCode?: unknown;
+  };
+  const isHttp404 = [obj.code, obj.status, obj.statusCode].some(
+    (value) => value === 404 || value === "404",
+  );
+  if (isHttp404) {
+    return true;
   }
-  if (typeof code === "string") {
-    return code === "-32001" || code === "-32600" || code === "404";
+
+  const hasSessionMarker =
+    typeof obj.message === "string" && obj.message.includes(SESSION_NOT_FOUND);
+  const hasSessionRpcCode =
+    obj.code === -32001 ||
+    obj.code === "-32001" ||
+    obj.code === -32600 ||
+    obj.code === "-32600";
+
+  return hasSessionMarker && hasSessionRpcCode;
+}
+
+function stringMatchesRequestTimeout(value: string): boolean {
+  return (
+    value.includes("-32001") &&
+    REQUEST_TIMEOUT_MARKERS.some((marker) => value.includes(marker))
+  );
+}
+
+function objectHasRequestTimeout(candidate: unknown): boolean {
+  if (typeof candidate !== "object" || candidate === null) {
+    return false;
   }
-  return false;
+
+  const obj = candidate as { code?: unknown; message?: unknown };
+  const message = obj.message;
+  const hasTimeoutCode = obj.code === -32001 || obj.code === "-32001";
+  const hasTimeoutMessage =
+    typeof message === "string" &&
+    REQUEST_TIMEOUT_MARKERS.some((marker) => message.includes(marker));
+  return hasTimeoutCode && hasTimeoutMessage;
 }
 
 function stringMatchesTransportLost(value: string): boolean {
@@ -230,15 +254,48 @@ export function isBackendTransportLostError(error: unknown): boolean {
   }
 }
 
+/** True only when replaying a non-idempotent tool call is safe. */
+export function isSafeToReplayToolCallError(error: unknown): boolean {
+  return isBackendSessionLostError(error) || isBackendTransportLostError(error);
+}
+
 /**
- * Convenience predicate — either the session-lost OR transport-lost
- * detector fires. Tool-call and dynamic-find recovery paths in
- * `metamcp-proxy.ts` use this so they engage the same invalidate +
- * reconnect + retry sequence regardless of which envelope the failure
- * arrived in.
+ * List requests are idempotent, so they may also reconnect after an SDK
+ * request timeout. A tool call must use isSafeToReplayToolCallError instead.
  */
 export function isRecoverableBackendError(error: unknown): boolean {
-  return isBackendSessionLostError(error) || isBackendTransportLostError(error);
+  if (isSafeToReplayToolCallError(error)) {
+    return true;
+  }
+
+  let current: unknown = error;
+  let depth = 0;
+  while (current != null && depth < MAX_CAUSE_DEPTH) {
+    if (typeof current === "string") {
+      return stringMatchesRequestTimeout(current);
+    }
+    if (objectHasRequestTimeout(current)) {
+      return true;
+    }
+    if (current instanceof Error) {
+      if (stringMatchesRequestTimeout(current.message)) {
+        return true;
+      }
+      current = (current as { cause?: unknown }).cause;
+      depth += 1;
+      continue;
+    }
+    if (typeof current === "object") {
+      try {
+        return stringMatchesRequestTimeout(JSON.stringify(current));
+      } catch {
+        return false;
+      }
+    }
+    return false;
+  }
+
+  return false;
 }
 
 export function isBackendSessionLostError(error: unknown): boolean {

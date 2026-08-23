@@ -5,7 +5,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   isBackendSessionLostError,
-  isRecoverableBackendError,
+  isSafeToReplayToolCallError,
 } from "./session-error";
 
 const proxySource = readFileSync(
@@ -27,13 +27,13 @@ describe("tools/call recovery gate", () => {
   it("classifies a torn-down transport as recoverable, and the narrow predicate does not", () => {
     const transportLost = new Error("Not connected");
 
-    expect(isRecoverableBackendError(transportLost)).toBe(true);
+    expect(isSafeToReplayToolCallError(transportLost)).toBe(true);
     // Precisely why the narrow predicate is the wrong gate for tools/call.
     expect(isBackendSessionLostError(transportLost)).toBe(false);
   });
 
-  it("gates the tools/call retry on the wide predicate", () => {
-    expect(proxySource).toContain("if (!isRecoverableBackendError(error)) {");
+  it("gates the tools/call retry on the replay-safe predicate", () => {
+    expect(proxySource).toContain("if (!isSafeToReplayToolCallError(error)) {");
   });
 
   it("does not import the narrow predicate into the proxy", () => {
