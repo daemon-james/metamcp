@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import express from "express";
 
 import {
@@ -20,10 +21,20 @@ import { SessionLifetimeManagerImpl } from "../../lib/session-lifetime-manager";
 const streamableHttpRouter = express.Router();
 
 // Session lifetime manager for StreamableHTTP sessions
-const sessionManager =
+export const sessionManager =
   new SessionLifetimeManagerImpl<StreamableHTTPServerTransport>(
     "StreamableHTTP",
   );
+
+function beginSessionRequest(sessionId: string): void {
+  sessionManager.beginRequest(sessionId);
+  metaMcpServerPool.beginRequest(sessionId);
+}
+
+function endSessionRequest(sessionId: string): void {
+  sessionManager.endRequest(sessionId);
+  metaMcpServerPool.endRequest(sessionId);
+}
 
 function getRequestContext(
   req: ApiKeyAuthenticatedRequest,
@@ -142,7 +153,12 @@ streamableHttpRouter.get(
       } else {
         logger.info(`Found session ${sessionId}, handling request`);
         normalizeStreamableHttpAcceptHeader(req);
-        await transport.handleRequest(req, res);
+        beginSessionRequest(sessionId);
+        try {
+          await transport.handleRequest(req, res);
+        } finally {
+          endSessionRequest(sessionId);
+        }
       }
     } catch (error) {
       logger.error("Error in public endpoint /mcp route:", error);
@@ -175,13 +191,27 @@ streamableHttpRouter.post(
     });
 
     if (!sessionId) {
+      if (!isInitializeRequest(req.body)) {
+        res.status(400).json({
+          jsonrpc: "2.0",
+          error: {
+            code: -32000,
+            message: "Bad Request: No valid session ID provided",
+          },
+          id: null,
+        });
+        return;
+      }
+
+      const newSessionId = randomUUID();
+      let transport: StreamableHTTPServerTransport | undefined;
+
       try {
         logger.info(
           `New public endpoint StreamableHttp connection request for ${endpointName} -> namespace ${namespaceUuid}`,
         );
 
         // Generate session ID upfront
-        const newSessionId = randomUUID();
         logger.info(
           `Generated new session ID: ${newSessionId} for endpoint: ${endpointName}`,
         );
@@ -212,7 +242,7 @@ streamableHttpRouter.post(
         );
 
         // Create transport with the predetermined session ID
-        const transport = new StreamableHTTPServerTransport({
+        transport = new StreamableHTTPServerTransport({
           enableJsonResponse: true,
           sessionIdGenerator: () => newSessionId,
           onsessioninitialized: async (sessionId) => {
@@ -247,14 +277,28 @@ streamableHttpRouter.post(
         );
 
         // Connect the server to the transport before handling the request
-        await mcpServerInstance.server.connect(transport);
+        beginSessionRequest(newSessionId);
+        try {
+          await mcpServerInstance.server.connect(transport);
 
-        // Now handle the request - server is guaranteed to be ready
-        normalizeStreamableHttpAcceptHeader(req);
-        res.type("application/json");
-        await transport.handleRequest(req, res);
+          // Now handle the request - server is guaranteed to be ready
+          normalizeStreamableHttpAcceptHeader(req);
+          res.type("application/json");
+          await transport.handleRequest(req, res);
+        } finally {
+          endSessionRequest(newSessionId);
+        }
       } catch (error) {
         logger.error("Error in public endpoint /mcp POST route:", error);
+
+        try {
+          await cleanupSession(newSessionId, transport);
+        } catch (cleanupError) {
+          logger.error(
+            `Error cleaning up failed session ${newSessionId}:`,
+            cleanupError,
+          );
+        }
 
         // Provide more detailed error information
         const errorMessage =
@@ -292,7 +336,12 @@ streamableHttpRouter.post(
           logger.info(`Found session ${sessionId}, handling request`);
           normalizeStreamableHttpAcceptHeader(req);
           res.type("application/json");
-          await transport.handleRequest(req, res);
+          beginSessionRequest(sessionId);
+          try {
+            await transport.handleRequest(req, res);
+          } finally {
+            endSessionRequest(sessionId);
+          }
         }
       } catch (error) {
         logger.error("Error in public endpoint /mcp route:", error);

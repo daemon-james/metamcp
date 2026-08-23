@@ -115,6 +115,8 @@ sseRouter.get(
       );
 
       sessionManager.addSession(sessionId, webAppTransport);
+      sessionManager.beginRequest(sessionId);
+      metaMcpServerPool.beginRequest(sessionId);
 
       // Handle cleanup when connection closes
       res.on("close", async () => {
@@ -124,7 +126,12 @@ sseRouter.get(
         await cleanupSession(sessionId);
       });
 
-      await mcpServerInstance.server.connect(webAppTransport);
+      try {
+        await mcpServerInstance.server.connect(webAppTransport);
+      } finally {
+        sessionManager.endRequest(sessionId);
+        metaMcpServerPool.endRequest(sessionId);
+      }
     } catch (error) {
       logger.error("Error in public endpoint /sse route:", error);
       res.status(500).json(error);
@@ -154,7 +161,14 @@ sseRouter.post(
         res.status(404).end("Session not found");
         return;
       }
-      await transport.handlePostMessage(req, res);
+      sessionManager.beginRequest(sessionId as string);
+      metaMcpServerPool.beginRequest(sessionId as string);
+      try {
+        await transport.handlePostMessage(req, res);
+      } finally {
+        sessionManager.endRequest(sessionId as string);
+        metaMcpServerPool.endRequest(sessionId as string);
+      }
     } catch (error) {
       logger.error("Error in public endpoint /message route:", error);
       res.status(500).json(error);
