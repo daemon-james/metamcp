@@ -26,6 +26,35 @@ export const sessionManager =
     "StreamableHTTP",
   );
 
+/**
+ * Read and parse the JSON body of a request on these routes.
+ *
+ * `index.ts` deliberately skips `express.json()` for `/metamcp/` and
+ * `/mcp-proxy/` so the SDK transport can read the raw stream, which means
+ * `req.body` is ALWAYS undefined here. Testing `isInitializeRequest(req.body)`
+ * against it therefore rejected every session-less POST including legitimate
+ * initialize requests, so no client could open a new session at all. A unit
+ * test that supplies `req.body` cannot see this; the rig caught it on the
+ * first fan-out.
+ *
+ * The stream can only be consumed once, so whatever this returns must be
+ * handed to `transport.handleRequest(req, res, parsedBody)` as its third
+ * argument rather than letting the transport re-read the request.
+ */
+async function readJsonBody(req: express.Request): Promise<unknown> {
+  if (req.body !== undefined) return req.body;
+  try {
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) {
+      chunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
+    }
+    if (chunks.length === 0) return undefined;
+    return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  } catch {
+    return undefined;
+  }
+}
+
 function beginSessionRequest(sessionId: string): void {
   sessionManager.beginRequest(sessionId);
   metaMcpServerPool.beginRequest(sessionId);
@@ -191,7 +220,8 @@ streamableHttpRouter.post(
     });
 
     if (!sessionId) {
-      if (!isInitializeRequest(req.body)) {
+      const parsedBody = await readJsonBody(req);
+      if (!isInitializeRequest(parsedBody)) {
         res.status(400).json({
           jsonrpc: "2.0",
           error: {
@@ -284,7 +314,8 @@ streamableHttpRouter.post(
           // Now handle the request - server is guaranteed to be ready
           normalizeStreamableHttpAcceptHeader(req);
           res.type("application/json");
-          await transport.handleRequest(req, res);
+          // The stream was consumed by readJsonBody, so pass the parsed value.
+          await transport.handleRequest(req, res, parsedBody);
         } finally {
           endSessionRequest(newSessionId);
         }
