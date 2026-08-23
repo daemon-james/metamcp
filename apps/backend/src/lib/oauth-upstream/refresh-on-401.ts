@@ -34,6 +34,11 @@ import {
   resolveTokenEndpointAuthMethod,
   UpstreamTokenError,
 } from "./token-exchange";
+import {
+  isRefreshTokenKnownDead,
+  isTerminalRefreshError,
+  markRefreshTokenDead,
+} from "./terminal-refresh-error";
 import { checkTokenExpiry, DEFAULT_REFRESH_SKEW_SECONDS } from "./token-expiry";
 
 export interface RefreshResult {
@@ -42,6 +47,7 @@ export interface RefreshResult {
     | "no_refresh_token"
     | "no_session"
     | "no_client_id"
+    | "needs_reauthorization"
     | "failed";
   tokens?: OAuthTokens;
   error?: string;
@@ -103,6 +109,20 @@ async function doRefresh(
     return { status: "no_refresh_token" };
   }
 
+  // Refuse a grant the authorization server has already rejected as final.
+  // Placed here rather than in refreshIfExpiring so it covers the 401-recovery
+  // path too (`client.ts`): a 401 carrying a revoked refresh token is no more
+  // recoverable than an expiry sweep is. Keyed on the token value, so the
+  // block lifts by itself once re-authorization stores a new one.
+  if (isRefreshTokenKnownDead(serverParams.uuid, currentTokens.refresh_token)) {
+    return {
+      status: "needs_reauthorization",
+      error: "invalid_grant",
+      errorDescription:
+        "Refresh token was rejected as final; re-authorize this server.",
+    };
+  }
+
   const clientInformation = session.client_information as Record<
     string,
     unknown
@@ -160,13 +180,40 @@ async function doRefresh(
     });
   } catch (error) {
     if (error instanceof UpstreamTokenError) {
+      const oauthError = error.oauthError?.error;
+      const terminal = isTerminalRefreshError({
+        oauthError,
+        status: error.status,
+      });
+
+      if (terminal) {
+        // Pin this exact refresh_token as dead so the 60s sweep stops
+        // re-POSTing a grant the authorization server has already rejected as
+        // final. Re-authorization stores a different token and lifts the block
+        // on its own.
+        markRefreshTokenDead(serverParams.uuid, currentTokens.refresh_token);
+        logger.error(
+          `[oauth] refresh token rejected as final — server=${serverParams.uuid} ` +
+            `(${serverParams.name}) status=${error.status} ` +
+            `error=${oauthError ?? "unknown"}. Re-authorize this server; ` +
+            `MetaMCP will not retry until its credentials change.`,
+        );
+        return {
+          status: "needs_reauthorization",
+          error: oauthError ?? "upstream_error",
+          errorDescription:
+            error.oauthError?.error_description ?? error.message,
+          upstreamStatus: error.status,
+        };
+      }
+
       logger.warn(
         `[oauth] proxy refresh failed — server=${serverParams.uuid} ` +
-          `status=${error.status} error=${error.oauthError?.error ?? "unknown"}`,
+          `status=${error.status} error=${oauthError ?? "unknown"}`,
       );
       return {
         status: "failed",
-        error: error.oauthError?.error ?? "upstream_error",
+        error: oauthError ?? "upstream_error",
         errorDescription: error.oauthError?.error_description ?? error.message,
         upstreamStatus: error.status,
       };
@@ -209,6 +256,28 @@ export async function refreshIfExpiring(
     skewSeconds,
   );
   if (!shouldRefresh) return null;
+
+  const currentTokens = session?.tokens as
+    | (OAuthTokens & { refresh_token?: string })
+    | null
+    | undefined;
+
+  // Check before announcing. doRefresh() blocks a known-dead grant too, but it
+  // does so after this line has already claimed a refresh is under way, and an
+  // expired token satisfies shouldRefresh on every 60s pass. Left alone that
+  // prints a refresh that never happens, once a minute, forever.
+  const refreshToken = currentTokens?.refresh_token;
+  if (
+    typeof refreshToken === "string" &&
+    isRefreshTokenKnownDead(serverParams.uuid, refreshToken)
+  ) {
+    return {
+      status: "needs_reauthorization",
+      error: "invalid_grant",
+      errorDescription:
+        "Refresh token was rejected as final; re-authorize this server.",
+    };
+  }
 
   logger.info(
     `[oauth] token for ${serverParams.name} (${serverParams.uuid}) expires at ` +

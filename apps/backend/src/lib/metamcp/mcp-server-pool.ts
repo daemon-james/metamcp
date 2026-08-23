@@ -9,6 +9,10 @@ import { ConnectedClient, connectMetaMcpClient } from "./client";
 import { serverRequiresForwardedHeaders } from "./header-forwarding";
 import { metamcpLogStore } from "./log-store";
 import { serverErrorTracker } from "./server-error-tracker";
+import {
+  countConnectionsForServer,
+  countTotalConnections,
+} from "./connection-counting";
 import { isClientSharedWithOtherSessions } from "./shared-connection";
 
 export interface McpServerPoolStatus {
@@ -18,6 +22,17 @@ export interface McpServerPoolStatus {
   idleServerUuids: string[];
   perServerCounts?: Record<string, number>;
   maxConnectionsPerServer?: number;
+}
+
+/**
+ * Read a pool sizing limit from the environment, falling back to `fallback`
+ * for unset, non-numeric, zero and negative values. Both limits are hard
+ * refusals rather than queues, so a value of 0 from a typo would wedge the
+ * pool into serving no connections at all.
+ */
+function readPositiveIntEnv(name: string, fallback: number): number {
+  const parsed = parseInt(process.env[name] || "", 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
 export class McpServerPool {
@@ -81,11 +96,14 @@ export class McpServerPool {
 
   private constructor(
     defaultIdleCount: number = 1,
-    maxTotalConnections: number = parseInt(
-      process.env.MAX_TOTAL_CONNECTIONS || "100",
-      10,
+    maxTotalConnections: number = readPositiveIntEnv(
+      "MAX_TOTAL_CONNECTIONS",
+      100,
     ),
-    maxConnectionsPerServer: number = 5,
+    maxConnectionsPerServer: number = readPositiveIntEnv(
+      "MAX_CONNECTIONS_PER_SERVER",
+      5,
+    ),
   ) {
     this.defaultIdleCount = defaultIdleCount;
     this.maxTotalConnections = maxTotalConnections;
@@ -99,11 +117,13 @@ export class McpServerPool {
    */
   static getInstance(
     defaultIdleCount: number = 1,
-    maxConnectionsPerServer: number = 5,
+    maxConnectionsPerServer: number = readPositiveIntEnv(
+      "MAX_CONNECTIONS_PER_SERVER",
+      5,
+    ),
   ): McpServerPool {
     if (!McpServerPool.instance) {
-      const envMax = parseInt(process.env.MAX_TOTAL_CONNECTIONS || "", 10);
-      const maxConn = Number.isFinite(envMax) && envMax > 0 ? envMax : 100;
+      const maxConn = readPositiveIntEnv("MAX_TOTAL_CONNECTIONS", 100);
       McpServerPool.instance = new McpServerPool(
         defaultIdleCount,
         maxConn,
@@ -117,26 +137,12 @@ export class McpServerPool {
    * Count all connections (idle + active + pending) for a specific server UUID
    */
   private countConnectionsForServer(serverUuid: string): number {
-    let count = 0;
-
-    // Count idle session
-    if (this.idleSessions[serverUuid]) {
-      count += 1;
-    }
-
-    // Count active sessions across all sessionIds
-    for (const sessionServers of Object.values(this.activeSessions)) {
-      if (sessionServers[serverUuid]) {
-        count += 1;
-      }
-    }
-
-    // Count pending idle creation
-    if (this.creatingIdleSessions.has(serverUuid)) {
-      count += 1;
-    }
-
-    return count;
+    return countConnectionsForServer({
+      activeSessions: this.activeSessions,
+      idleSessions: this.idleSessions,
+      creatingIdleSessions: this.creatingIdleSessions,
+      serverUuid,
+    });
   }
 
   /**
@@ -655,14 +661,11 @@ export class McpServerPool {
    * Get total connection count (idle + active + pending)
    */
   private getTotalConnectionCount(): number {
-    const idle = Object.keys(this.idleSessions).length;
-    const active = Object.keys(this.activeSessions).reduce(
-      (total, sessionId) =>
-        total + Object.keys(this.activeSessions[sessionId]).length,
-      0,
-    );
-    const pending = this.creatingIdleSessions.size;
-    return idle + active + pending;
+    return countTotalConnections({
+      activeSessions: this.activeSessions,
+      idleSessions: this.idleSessions,
+      creatingIdleSessions: this.creatingIdleSessions,
+    });
   }
 
   /**

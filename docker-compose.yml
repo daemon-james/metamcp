@@ -1,7 +1,7 @@
 services:
   app:
     container_name: metamcp
-    # Local build (docker build -t metamcp:oauth-refresh .). Carries fixes that
+    # Local build (docker build -t metamcp:oauth-discover .). Carries fixes that
     # are not upstream:
     #   - mcp-proxy/server.ts: the SseError-only 401 check missed
     #     STREAMABLE_HTTP, so OAuth-protected servers (sentry) could never
@@ -12,7 +12,10 @@ services:
     #   - client.ts: reload OAuth tokens from the DB on every connect (the pool
     #     cached a snapshot), and flag error_status when a remote server
     #     exhausts its connection attempts.
-    image: metamcp:oauth-refresh
+    #   - oauth.discover + DbOAuthClientProvider.discoveryState: browser-side
+    #     well-known fetch 404s to /authorize when the upstream omits CORS
+    #     (Plecto publishes /oauth/authorize/).
+    image: metamcp:oauth-discover
     env_file:
       - .env
     ports:
@@ -50,6 +53,20 @@ services:
       # session that is reaped recovers transparently — getSession() re-initialises
       # an unknown sessionId from the idle pool on the next call.
       SESSION_LIFETIME: ${SESSION_LIFETIME:-1800000} # 30 minutes, in milliseconds
+
+      # Upstream connection pool sizing. Both are hard refusals, not queues:
+      # past either limit the pool returns no session, the backend drops out of
+      # tools/list, and the client sees a namespace missing most of its tools.
+      #
+      # MAX_CONNECTIONS_PER_SERVER is what forces concurrent client sessions to
+      # SHARE one upstream transport, so raising it hurts fan-out. Every session
+      # below the cap spawns its own stdio child per backend: measured 2026-08-23,
+      # 12 concurrent sessions over 15 backends at a cap of 8 spawned 406
+      # connections, drove the container to 1571 PIDs / 10.5GiB, and pushed
+      # tools/list to 51s — past the client's 30s discovery timeout. Keep this
+      # low. Distinct connections are min(sessions, cap) x backends.
+      MAX_TOTAL_CONNECTIONS: ${MAX_TOTAL_CONNECTIONS:-200}
+      MAX_CONNECTIONS_PER_SERVER: ${MAX_CONNECTIONS_PER_SERVER:-2}
       
       # ========================================================================
       # Bootstrap Configuration Examples
