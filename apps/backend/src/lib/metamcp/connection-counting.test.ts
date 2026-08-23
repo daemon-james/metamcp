@@ -27,6 +27,7 @@ describe("connection counting", () => {
         activeSessions,
         idleSessions: {},
         creatingIdleSessions: new Set(),
+        creatingActiveConnections: new Map(),
         serverUuid: "server-a",
       }),
     ).toBe(1);
@@ -43,6 +44,7 @@ describe("connection counting", () => {
         activeSessions,
         idleSessions: {},
         creatingIdleSessions: new Set(),
+        creatingActiveConnections: new Map(),
         serverUuid: "server-a",
       }),
     ).toBe(2);
@@ -56,6 +58,7 @@ describe("connection counting", () => {
         activeSessions: { "session-1": { "server-a": client } },
         idleSessions: { "server-a": client },
         creatingIdleSessions: new Set(),
+        creatingActiveConnections: new Map(),
         serverUuid: "server-a",
       }),
     ).toBe(1);
@@ -67,6 +70,7 @@ describe("connection counting", () => {
         activeSessions: {},
         idleSessions: {},
         creatingIdleSessions: new Set(["server-a"]),
+        creatingActiveConnections: new Map(),
         serverUuid: "server-a",
       }),
     ).toBe(1);
@@ -88,6 +92,7 @@ describe("connection counting", () => {
         activeSessions,
         idleSessions: {},
         creatingIdleSessions: new Set(),
+        creatingActiveConnections: new Map(),
       }),
     ).toBe(2);
   });
@@ -98,6 +103,7 @@ describe("connection counting", () => {
         activeSessions: { "session-1": { "server-a": conn("a") } },
         idleSessions: { "server-b": conn("b") },
         creatingIdleSessions: new Set(["server-c"]),
+        creatingActiveConnections: new Map(),
       }),
     ).toBe(3);
   });

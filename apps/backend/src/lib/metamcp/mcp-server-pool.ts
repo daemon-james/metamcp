@@ -6,13 +6,13 @@ import { mcpServersRepository } from "../../db/repositories";
 import { configService } from "../config.service";
 import { refreshIfExpiring } from "../oauth-upstream/refresh-on-401";
 import { ConnectedClient, connectMetaMcpClient } from "./client";
-import { serverRequiresForwardedHeaders } from "./header-forwarding";
-import { metamcpLogStore } from "./log-store";
-import { serverErrorTracker } from "./server-error-tracker";
 import {
   countConnectionsForServer,
   countTotalConnections,
 } from "./connection-counting";
+import { serverRequiresForwardedHeaders } from "./header-forwarding";
+import { metamcpLogStore } from "./log-store";
+import { serverErrorTracker } from "./server-error-tracker";
 import { isClientSharedWithOtherSessions } from "./shared-connection";
 
 export interface McpServerPoolStatus {
@@ -56,6 +56,12 @@ export class McpServerPool {
 
   // Track ongoing idle session creation to prevent duplicates
   private creatingIdleSessions: Set<string> = new Set();
+
+  // Each promise resolves when one active connection attempt finishes. The
+  // sets reserve cap slots and give waiting non-forwarded sessions a signal to
+  // retry once a shareable connection may exist.
+  private creatingActiveConnections: Map<string, Set<Promise<void>>> =
+    new Map();
 
   // Generation counter per server UUID: incremented by invalidateIdleSession() so
   // any in-flight createIdleSession / createIdleSessionAsync that resolves with a
@@ -141,6 +147,7 @@ export class McpServerPool {
       activeSessions: this.activeSessions,
       idleSessions: this.idleSessions,
       creatingIdleSessions: this.creatingIdleSessions,
+      creatingActiveConnections: this.creatingActiveConnections,
       serverUuid,
     });
   }
@@ -157,6 +164,37 @@ export class McpServerPool {
       return false;
     }
     return true;
+  }
+
+  /**
+   * Reserve one active connection attempt before its first await.
+   */
+  private reserveActiveConnectionAttempt(
+    serverUuid: string,
+  ): (() => void) | undefined {
+    if (
+      !this.canCreateConnectionForServer(serverUuid) ||
+      !this.canCreateConnection()
+    ) {
+      return undefined;
+    }
+
+    let resolveAttempt: () => void;
+    const attempt = new Promise<void>((resolve) => {
+      resolveAttempt = resolve;
+    });
+    const attempts =
+      this.creatingActiveConnections.get(serverUuid) ?? new Set();
+    attempts.add(attempt);
+    this.creatingActiveConnections.set(serverUuid, attempts);
+
+    return () => {
+      attempts.delete(attempt);
+      if (attempts.size === 0) {
+        this.creatingActiveConnections.delete(serverUuid);
+      }
+      resolveAttempt();
+    };
   }
 
   /**
@@ -195,6 +233,8 @@ export class McpServerPool {
     params: ServerParameters,
     namespaceUuid?: string,
   ): Promise<ConnectedClient | undefined> {
+    const requiresForwardedHeaders = serverRequiresForwardedHeaders(params);
+
     // Update server params cache
     this.serverParamsCache[serverUuid] = params;
 
@@ -215,7 +255,7 @@ export class McpServerPool {
     // Check if we have an idle session for this server that we can convert.
     // Skip idle reuse for servers with forward_headers since each client may
     // need unique credentials forwarded to the backend MCP server.
-    if (!serverRequiresForwardedHeaders(params)) {
+    if (!requiresForwardedHeaders) {
       const idleClient = this.idleSessions[serverUuid];
       if (idleClient) {
         // Convert idle session to active session
@@ -234,21 +274,42 @@ export class McpServerPool {
       }
     }
 
-    // No idle session available — check per-server cap before spawning
-    if (!this.canCreateConnectionForServer(serverUuid)) {
-      // At cap: reuse the oldest active connection instead of spawning
+    const releaseReservation = this.reserveActiveConnectionAttempt(serverUuid);
+    if (!releaseReservation) {
+      // A forwarded-header transport contains one caller's credentials and
+      // cannot serve another session. Refuse at the cap instead of sharing it.
+      if (requiresForwardedHeaders) {
+        return undefined;
+      }
+
+      // Reuse an active connection when a non-forwarded server is at a cap.
       const reusable = this.findOldestActiveConnectionForServer(serverUuid);
       if (reusable) {
         logger.info(
-          `Reusing existing connection for server ${serverUuid} (at per-server cap ${this.maxConnectionsPerServer})`,
+          `Reusing existing connection for server ${serverUuid} (connection cap reached)`,
         );
         this.activeSessions[sessionId][serverUuid] = reusable;
         this.sessionToServers[sessionId].add(serverUuid);
         return reusable;
       }
+
+      // The cap may consist only of dials that have not reached
+      // activeSessions yet. Wait for one to finish, then retry and share it.
+      const attempts = this.creatingActiveConnections.get(serverUuid);
+      if (attempts?.size) {
+        await Promise.race(attempts);
+        return this.getSession(sessionId, serverUuid, params, namespaceUuid);
+      }
+
+      return undefined;
     }
 
-    const newClient = await this.createNewConnection(params, namespaceUuid);
+    let newClient: ConnectedClient | undefined;
+    try {
+      newClient = await this.createNewConnection(params, namespaceUuid);
+    } finally {
+      releaseReservation();
+    }
     if (!newClient) {
       return undefined;
     }
@@ -276,7 +337,7 @@ export class McpServerPool {
     // Only pre-warm idle pool for servers that don't require forwarded headers.
     // Idle sessions are created without per-client headers, so they can't be
     // reused when per-client header forwarding is configured.
-    if (!serverRequiresForwardedHeaders(params)) {
+    if (!requiresForwardedHeaders) {
       this.createIdleSessionAsync(serverUuid, params, namespaceUuid);
     }
 
@@ -290,14 +351,6 @@ export class McpServerPool {
     params: ServerParameters,
     namespaceUuid?: string,
   ): Promise<ConnectedClient | undefined> {
-    // Check connection limit before attempting to create
-    if (!this.canCreateConnection()) {
-      logger.warn(
-        `Skipping connection for server ${params.name} (${params.uuid}) - connection limit reached`,
-      );
-      return undefined;
-    }
-
     logger.info(
       `Creating new connection for server ${params.name} (${params.uuid}) with namespace: ${namespaceUuid || "none"}`,
     );
@@ -368,8 +421,11 @@ export class McpServerPool {
       return;
     }
 
-    // Don't create if at per-server cap
-    if (!this.canCreateConnectionForServer(serverUuid)) {
+    // Reserve both cap checks before adding the pending idle slot.
+    if (
+      !this.canCreateConnectionForServer(serverUuid) ||
+      !this.canCreateConnection()
+    ) {
       return;
     }
 
@@ -430,8 +486,11 @@ export class McpServerPool {
       return;
     }
 
-    // Check per-server cap before spawning a background idle
-    if (!this.canCreateConnectionForServer(serverUuid)) {
+    // Reserve both cap checks before adding the pending idle slot.
+    if (
+      !this.canCreateConnectionForServer(serverUuid) ||
+      !this.canCreateConnection()
+    ) {
       return;
     }
 
@@ -665,6 +724,7 @@ export class McpServerPool {
       activeSessions: this.activeSessions,
       idleSessions: this.idleSessions,
       creatingIdleSessions: this.creatingIdleSessions,
+      creatingActiveConnections: this.creatingActiveConnections,
     });
   }
 
