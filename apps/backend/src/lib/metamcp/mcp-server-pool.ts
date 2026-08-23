@@ -171,9 +171,10 @@ export class McpServerPool {
    */
   private reserveActiveConnectionAttempt(
     serverUuid: string,
+    enforcePerServerCap: boolean = true,
   ): (() => void) | undefined {
     if (
-      !this.canCreateConnectionForServer(serverUuid) ||
+      (enforcePerServerCap && !this.canCreateConnectionForServer(serverUuid)) ||
       !this.canCreateConnection()
     ) {
       return undefined;
@@ -235,8 +236,12 @@ export class McpServerPool {
   ): Promise<ConnectedClient | undefined> {
     const requiresForwardedHeaders = serverRequiresForwardedHeaders(params);
 
-    // Update server params cache
-    this.serverParamsCache[serverUuid] = params;
+    // Forwarded-header params include one caller's credential. These servers
+    // cannot use background or idle connections, so retaining those params
+    // would keep a credential after its client session ends.
+    if (!requiresForwardedHeaders) {
+      this.serverParamsCache[serverUuid] = params;
+    }
 
     // Check if we already have an active session for this sessionId and server
     if (this.activeSessions[sessionId]?.[serverUuid]) {
@@ -274,10 +279,17 @@ export class McpServerPool {
       }
     }
 
-    const releaseReservation = this.reserveActiveConnectionAttempt(serverUuid);
+    // Forwarded-header connections belong to one client session and cannot be
+    // shared at the per-server cap. Give them separate connections while the
+    // pool still has room under its global cap.
+    const releaseReservation = this.reserveActiveConnectionAttempt(
+      serverUuid,
+      !requiresForwardedHeaders,
+    );
     if (!releaseReservation) {
       // A forwarded-header transport contains one caller's credentials and
-      // cannot serve another session. Refuse at the cap instead of sharing it.
+      // cannot serve another session. It reaches this branch only when the
+      // global connection cap has no room.
       if (requiresForwardedHeaders) {
         return undefined;
       }

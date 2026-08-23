@@ -96,35 +96,52 @@ describe("McpServerPool connection caps", () => {
     await pool.cleanupAll();
   });
 
-  it("never shares forwarded-header connections but still shares ordinary connections at the cap", async () => {
-    connectMetaMcpClient.mockImplementation(async (params: ServerParameters) =>
-      makeClient(String(params.headers?.["X-Caller"] ?? "ordinary")),
+  it("gives forwarded headers separate clients past the per-server cap", async () => {
+    let clientNumber = 0;
+    connectMetaMcpClient.mockImplementation(async () => {
+      clientNumber += 1;
+      return makeClient(`forwarded-${clientNumber}`);
+    });
+
+    const sessions = await Promise.all(
+      ["caller-a", "caller-b", "caller-c", "caller-d"].map(
+        (forwardedValue, index) =>
+          pool.getSession(
+            `forwarded-${index}`,
+            "forwarded-server",
+            makeServer("forwarded-server", { forwardedValue }),
+          ),
+      ),
     );
 
-    const first = await pool.getSession(
-      "forwarded-1",
-      "forwarded-server",
-      makeServer("forwarded-server", { forwardedValue: "caller-a" }),
-    );
-    const second = await pool.getSession(
-      "forwarded-2",
-      "forwarded-server",
-      makeServer("forwarded-server", { forwardedValue: "caller-b" }),
-    );
-    const third = await pool.getSession(
-      "forwarded-3",
-      "forwarded-server",
-      makeServer("forwarded-server", { forwardedValue: "caller-c" }),
-    );
-
-    expect(first).toBeDefined();
-    expect(second).toBeDefined();
-    expect(third).toBeUndefined();
-    expect(third).not.toBe(first);
-    expect(third).not.toBe(second);
+    expect(sessions.every((session) => session !== undefined)).toBe(true);
+    expect(new Set(sessions).size).toBe(4);
+    expect(connectMetaMcpClient).toHaveBeenCalledTimes(4);
 
     await pool.cleanupAll();
     connectMetaMcpClient.mockClear();
+
+    const sameCredentialParams = makeServer("forwarded-server", {
+      forwardedValue: "same-caller",
+    });
+    const [sameCredentialFirst, sameCredentialSecond] = await Promise.all([
+      pool.getSession("same-1", "forwarded-server", sameCredentialParams),
+      pool.getSession("same-2", "forwarded-server", sameCredentialParams),
+    ]);
+
+    expect(sameCredentialFirst).toBeDefined();
+    expect(sameCredentialSecond).toBeDefined();
+    expect(sameCredentialFirst).not.toBe(sameCredentialSecond);
+    expect(connectMetaMcpClient).toHaveBeenCalledTimes(2);
+    const serverParamsCache = Reflect.get(pool, "serverParamsCache") as Record<
+      string,
+      ServerParameters
+    >;
+    expect(Object.hasOwn(serverParamsCache, "forwarded-server")).toBe(false);
+  });
+
+  it("shares ordinary connections at the per-server cap", async () => {
+    connectMetaMcpClient.mockImplementation(async () => makeClient("ordinary"));
 
     const ordinaryParams = makeServer("ordinary-server");
     const ordinaryFirst = await pool.getSession(

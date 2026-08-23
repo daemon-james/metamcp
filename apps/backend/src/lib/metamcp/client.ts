@@ -29,6 +29,20 @@ import { resolveEnvVariables } from "./utils";
 const sleep = (time: number) =>
   new Promise<void>((resolve) => setTimeout(() => resolve(), time));
 
+const TERMINAL_STDIO_SPAWN_ERROR_CODES = new Set(["ENOENT", "EACCES", "EPERM"]);
+
+function isTerminalStdioSpawnError(
+  serverParams: ServerParameters,
+  error: unknown,
+): boolean {
+  if (serverParams.type && serverParams.type !== "STDIO") {
+    return false;
+  }
+
+  const code = (error as NodeJS.ErrnoException | null)?.code;
+  return code !== undefined && TERMINAL_STDIO_SPAWN_ERROR_CODES.has(code);
+}
+
 export interface ConnectedClient {
   client: Client;
   cleanup: () => Promise<void>;
@@ -429,6 +443,23 @@ export const connectMetaMcpClient = async (
 
       const isHttpServer =
         serverParams.type === "SSE" || serverParams.type === "STREAMABLE_HTTP";
+
+      // The OS has refused to execute the configured stdio command. Waiting
+      // and spawning the same command again cannot fix a missing binary or its
+      // execute permissions. Flag it now and preserve the spawn error for the
+      // caller.
+      if (isTerminalStdioSpawnError(serverParams, error)) {
+        const reason =
+          error instanceof Error ? error.message : "stdio process spawn failed";
+        logger.warn(
+          `Not retrying ${serverParams.name} (${serverParams.uuid}): ${reason}`,
+        );
+        await serverErrorTracker.recordConnectionFailure(
+          serverParams.uuid,
+          reason,
+        );
+        throw error;
+      }
 
       // Recovery cascade — ORDER IS LOAD-BEARING. Do not reorder without
       // re-reading the rationale below.
