@@ -1,6 +1,8 @@
 import { registerClient } from "@modelcontextprotocol/sdk/client/auth.js";
 import { OAuthClientInformation } from "@modelcontextprotocol/sdk/shared/auth.js";
 import {
+  DiscoverOAuthRequestSchema,
+  DiscoverOAuthResponseSchema,
   ExchangeOAuthTokenRequestSchema,
   ExchangeOAuthTokenResponseSchema,
   GetOAuthSessionRequestSchema,
@@ -460,6 +462,28 @@ export const oauthImplementations = {
           error_description:
             "OAuth session has no client_id; cannot refresh tokens.",
         };
+      case "needs_reauthorization":
+        // The authorization server rejected the refresh token as final
+        // (RFC 6749 5.2). Retrying cannot help and MetaMCP has stopped
+        // trying, so tell the caller the one thing that does: re-authorize.
+        // Always state the action. The upstream often sends no
+        // error_description, in which case tryRefreshUpstreamTokens falls back
+        // to the error message, which is the bare code again: a user shown
+        // "invalid_grant" learns nothing about what to do. Keep any real
+        // upstream detail, but never let it stand alone.
+        return {
+          success: false as const,
+          error: result.error ?? "invalid_grant",
+          error_description: [
+            "The refresh token was rejected as final. Re-authorize this server.",
+            result.errorDescription && result.errorDescription !== result.error
+              ? `Upstream said: ${result.errorDescription}`
+              : null,
+          ]
+            .filter(Boolean)
+            .join(" "),
+          upstream_status: result.upstreamStatus,
+        };
       case "failed":
         return {
           success: false as const,
@@ -519,6 +543,75 @@ export const oauthImplementations = {
       return {
         success: false as const,
         error: "registration_failed",
+        error_description:
+          error instanceof Error ? error.message : String(error),
+      };
+    }
+  },
+
+  // Server-side RFC 9728 + RFC 8414 discovery for the browser OAuth
+  // provider. The SDK's auth() prefers provider.discoveryState() over
+  // fetching well-known documents from the page origin. Providers that
+  // omit CORS on those documents (Plecto) otherwise fall back to
+  // `{origin}/authorize` and the user sees a 404.
+  discover: async (
+    input: z.infer<typeof DiscoverOAuthRequestSchema>,
+    userId: string,
+  ): Promise<z.infer<typeof DiscoverOAuthResponseSchema>> => {
+    const serverResolution = await resolveOwnedServerUrl(
+      input.mcp_server_uuid,
+      userId,
+    );
+    if (!serverResolution.ok) {
+      return { success: false as const, ...serverResolution.error };
+    }
+    const serverUrl = serverResolution.url;
+
+    try {
+      const resolved = await resolveAuthorizationServer(serverUrl);
+      const authorizationEndpoint = resolved.metadata?.authorization_endpoint;
+      if (!resolved.metadata || !authorizationEndpoint) {
+        return {
+          success: false as const,
+          error: "discovery_failed",
+          error_description: `No authorization server metadata at ${serverUrl}`,
+        };
+      }
+
+      const authorizationServerUrl =
+        resolved.issuer ?? new URL(authorizationEndpoint).origin;
+
+      return {
+        success: true as const,
+        data: {
+          authorizationServerUrl,
+          resourceMetadataUrl: new URL(
+            "/.well-known/oauth-protected-resource",
+            serverUrl,
+          ).href,
+          resourceMetadata: {
+            ...(resolved.resource ? { resource: resolved.resource } : {}),
+            ...(resolved.issuer
+              ? { authorization_servers: [resolved.issuer] }
+              : {}),
+            ...(resolved.scopesSupported
+              ? { scopes_supported: resolved.scopesSupported }
+              : {}),
+          },
+          // `authorizationEndpoint` was narrowed to a non-empty string above.
+          // Spreading it back in is what proves to the type system that the
+          // document satisfies the schema's required `authorization_endpoint`,
+          // which the SDK's startAuthorization reads.
+          authorizationServerMetadata: {
+            ...resolved.metadata,
+            authorization_endpoint: authorizationEndpoint,
+          },
+        },
+      };
+    } catch (error) {
+      return {
+        success: false as const,
+        error: "discovery_failed",
         error_description:
           error instanceof Error ? error.message : String(error),
       };

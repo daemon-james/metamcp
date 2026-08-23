@@ -1,4 +1,6 @@
 import {
+  DiscoverOAuthRequestSchema,
+  DiscoverOAuthResponseSchema,
   ExchangeOAuthTokenRequestSchema,
   ExchangeOAuthTokenResponseSchema,
   GetOAuthSessionRequestSchema,
@@ -37,6 +39,10 @@ export const createOAuthRouter = (
       input: z.infer<typeof RegisterOAuthClientRequestSchema>,
       userId: string,
     ) => Promise<z.infer<typeof RegisterOAuthClientResponseSchema>>;
+    discover: (
+      input: z.infer<typeof DiscoverOAuthRequestSchema>,
+      userId: string,
+    ) => Promise<z.infer<typeof DiscoverOAuthResponseSchema>>;
   },
 ) => {
   return router({
@@ -89,6 +95,17 @@ export const createOAuthRouter = (
       .output(RegisterOAuthClientResponseSchema)
       .mutation(async ({ input, ctx }) => {
         return await implementations.register(input, ctx.user.id);
+      }),
+
+    // Protected: Server-side RFC 9728 + RFC 8414 discovery. Same CORS
+    // rationale as register — providers such as Plecto serve well-known
+    // metadata without Access-Control-Allow-Origin, so the browser SDK
+    // never sees authorization_endpoint and redirects to /authorize (404).
+    discover: protectedProcedure
+      .input(DiscoverOAuthRequestSchema)
+      .output(DiscoverOAuthResponseSchema)
+      .query(async ({ input, ctx }) => {
+        return await implementations.discover(input, ctx.user.id);
       }),
   });
 };

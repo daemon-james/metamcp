@@ -498,6 +498,51 @@ describe("oauthImplementations.refreshToken", () => {
     fetchSpy.mockRestore();
   });
 
+  it("surfaces a terminally-rejected grant as needs re-authorization", async () => {
+    // RefreshResult gained "needs_reauthorization" when terminal RFC 6749 5.2
+    // errors stopped being retried. This switch was not updated, so the
+    // function fell through every case and returned undefined, which tsc
+    // caught as TS2366 and nothing else did. The caller needs the one action
+    // that resolves it, which is re-authorizing, not a generic failure.
+    const { oauthImplementations, findByMcpServerUuid, findServerByUuid } =
+      await loadModule();
+    findServerByUuid.mockResolvedValue(
+      ownedServer(SERVER_UUID, "https://example.com/mcp"),
+    );
+    findByMcpServerUuid.mockResolvedValue({
+      mcp_server_uuid: SERVER_UUID,
+      client_information: { client_id: "x", token_endpoint: "https://up/token" },
+      tokens: {
+        access_token: "AT",
+        token_type: "Bearer",
+        refresh_token: "RT_revoked",
+      },
+    });
+
+    const fetchSpy = vi
+      .spyOn(globalThis, "fetch")
+      .mockImplementation(async (url) => {
+        const urlStr = typeof url === "string" ? url : (url as URL).toString();
+        if (urlStr.includes("/.well-known/")) {
+          return new Response("nope", { status: 404 });
+        }
+        return jsonResponse(400, { error: "invalid_grant" });
+      });
+
+    const result = await oauthImplementations.refreshToken(
+      { mcp_server_uuid: SERVER_UUID },
+      USER_ID,
+    );
+
+    expect(result).toBeDefined();
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error).toBe("invalid_grant");
+      expect(result.error_description).toMatch(/re-authorize/i);
+    }
+    fetchSpy.mockRestore();
+  });
+
   it("returns no_refresh_token when the session has no refresh_token", async () => {
     const { oauthImplementations, findByMcpServerUuid, findServerByUuid } =
       await loadModule();
@@ -826,5 +871,124 @@ describe("exchangeToken state CSRF validation", () => {
         expected_state: "the-csrf-nonce",
       }),
     );
+  });
+});
+
+describe("oauthImplementations.discover", () => {
+  beforeEach(() => {
+    process.env.APP_URL = "https://metamcp.example.com";
+    vi.clearAllMocks();
+  });
+  afterEach(() => {
+    process.env.APP_URL = ORIGINAL_APP_URL;
+  });
+
+  const loadModule = async () => {
+    const repos = await import("../db/repositories");
+    const impl = await import("./oauth.impl");
+    return {
+      oauthImplementations: impl.oauthImplementations,
+      findServerByUuid: repos.mcpServersRepository.findByUuid as ReturnType<
+        typeof vi.fn
+      >,
+    };
+  };
+
+  const ownedServer = (uuid: string, url: string, userId = "user-1") => ({
+    uuid,
+    name: "test-server",
+    type: "STREAMABLE_HTTP" as const,
+    url,
+    user_id: userId,
+    description: null,
+    command: null,
+    args: [] as string[],
+    env: {},
+    error_status: "NONE" as const,
+    created_at: new Date(),
+    bearerToken: null,
+    headers: {},
+  });
+
+  const USER_ID = "user-1";
+  const SERVER_UUID = "00000000-0000-0000-0000-000000000abc";
+
+  it("returns authorization_endpoint from RFC 9728 + RFC 8414 metadata", async () => {
+    const { oauthImplementations, findServerByUuid } = await loadModule();
+    findServerByUuid.mockResolvedValue(
+      ownedServer(SERVER_UUID, "https://app.plecto.com/api/mcp/"),
+    );
+
+    const fetchSpy = vi
+      .spyOn(globalThis, "fetch")
+      .mockImplementation(async (url) => {
+        const urlStr = typeof url === "string" ? url : (url as URL).toString();
+        if (urlStr.endsWith("/.well-known/oauth-protected-resource")) {
+          return jsonResponse(200, {
+            resource: "https://app.plecto.com/api/mcp/",
+            authorization_servers: ["https://app.plecto.com"],
+            scopes_supported: ["read", "write"],
+          });
+        }
+        if (urlStr.endsWith("/.well-known/oauth-authorization-server")) {
+          return jsonResponse(200, {
+            issuer: "https://app.plecto.com",
+            authorization_endpoint: "https://app.plecto.com/oauth/authorize/",
+            token_endpoint: "https://app.plecto.com/oauth/token/",
+            registration_endpoint: "https://app.plecto.com/oauth/register/",
+            response_types_supported: ["code"],
+            code_challenge_methods_supported: ["S256"],
+          });
+        }
+        return new Response("not found", { status: 404 });
+      });
+
+    const result = await oauthImplementations.discover(
+      { mcp_server_uuid: SERVER_UUID },
+      USER_ID,
+    );
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.authorizationServerUrl).toBe("https://app.plecto.com");
+      expect(result.data.authorizationServerMetadata.authorization_endpoint).toBe(
+        "https://app.plecto.com/oauth/authorize/",
+      );
+      expect(result.data.resourceMetadata?.resource).toBe(
+        "https://app.plecto.com/api/mcp/",
+      );
+    }
+    fetchSpy.mockRestore();
+  });
+
+  it("returns access_denied when a different user owns the server", async () => {
+    const { oauthImplementations, findServerByUuid } = await loadModule();
+    findServerByUuid.mockResolvedValue(
+      ownedServer(SERVER_UUID, "https://app.plecto.com/api/mcp/", "other-user"),
+    );
+    const result = await oauthImplementations.discover(
+      { mcp_server_uuid: SERVER_UUID },
+      USER_ID,
+    );
+    expect(result.success).toBe(false);
+    if (!result.success) expect(result.error).toBe("access_denied");
+  });
+
+  it("returns discovery_failed when no authorization server metadata exists", async () => {
+    const { oauthImplementations, findServerByUuid } = await loadModule();
+    findServerByUuid.mockResolvedValue(
+      ownedServer(SERVER_UUID, "https://app.example.com/mcp"),
+    );
+    const fetchSpy = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(new Response("nope", { status: 404 }));
+
+    const result = await oauthImplementations.discover(
+      { mcp_server_uuid: SERVER_UUID },
+      USER_ID,
+    );
+    expect(result.success).toBe(false);
+    if (!result.success) expect(result.error).toBe("discovery_failed");
+    fetchSpy.mockRestore();
   });
 });

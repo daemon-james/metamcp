@@ -9,7 +9,7 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
-import { isFlaggedErrorStatus, McpServerTypeEnum } from "@repo/zod-types";
+import { McpServerErrorStatusEnum, McpServerTypeEnum } from "@repo/zod-types";
 import express from "express";
 import { parse as shellParseArgs } from "shell-quote";
 import { findActualExecutable } from "spawn-rx";
@@ -153,7 +153,13 @@ const checkServerErrorStatus = async (serverUuid: string): Promise<boolean> => {
       return false;
     }
 
-    const isInError = isFlaggedErrorStatus(server.error_status);
+    // Only ERROR blocks the inspector/Connect path. UNAUTHORIZED is the
+    // state we put a server in after an idle 401 — refusing the connection
+    // here means auth() never sees that 401 and the OAuth redirect never
+    // opens (Plecto, and any other STREAMABLE_HTTP server marked this way).
+    // The pool still uses isFlaggedErrorStatus so it does not re-dial.
+    const isInError =
+      server.error_status === McpServerErrorStatusEnum.enum.ERROR;
     if (isInError) {
       logger.info(`Server ${server.name} (${serverUuid}) is in ERROR state`);
     }

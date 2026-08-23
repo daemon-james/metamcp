@@ -272,6 +272,46 @@ export const RefreshOAuthTokenResponseSchema = z.union([
   }),
 ]);
 
+// Server-side RFC 9728 + RFC 8414 discovery. Browser-side SDK discovery
+// fails when the upstream well-known documents omit CORS
+// (Access-Control-Allow-Origin). The MCP SDK then falls back to
+// `{origin}/authorize`, which 404s on providers that publish
+// `/oauth/authorize/` (Plecto). Same ownership/SSRF rule as register:
+// the upstream URL is loaded from the mcp_servers row, never the request.
+export const DiscoverOAuthRequestSchema = z.object({
+  mcp_server_uuid: z.string().uuid(),
+});
+
+export const DiscoverOAuthResponseSchema = z.union([
+  z.object({
+    success: z.literal(true),
+    data: z.object({
+      authorizationServerUrl: z.string(),
+      resourceMetadataUrl: z.string().optional(),
+      resourceMetadata: z
+        .object({
+          resource: z.string().optional(),
+          authorization_servers: z.array(z.string()).optional(),
+          scopes_supported: z.array(z.string()).optional(),
+        })
+        .passthrough()
+        .optional(),
+      // Full AS metadata document. Must keep response_types_supported and
+      // authorization_endpoint — the SDK's startAuthorization reads both.
+      authorizationServerMetadata: z
+        .object({
+          authorization_endpoint: z.string(),
+        })
+        .passthrough(),
+    }),
+  }),
+  z.object({
+    success: z.literal(false),
+    error: z.string(),
+    error_description: z.string().optional(),
+  }),
+]);
+
 // Repository-specific schemas.
 //
 // `tokens` is typed against UpstreamTokenResponseSchema (RFC 6749 +
