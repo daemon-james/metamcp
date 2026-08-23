@@ -7,11 +7,13 @@ const mocks = vi.hoisted(() => ({
   clientClose: vi.fn(),
   configTimeout: vi.fn(),
   findOAuthSession: vi.fn(),
+  getServerMaxAttempts: vi.fn(),
   isServerInErrorState: vi.fn(),
   recordConnectionFailure: vi.fn(),
   resetServerErrorState: vi.fn(),
   sdkConnect: vi.fn(),
   transportClose: vi.fn(),
+  transportStart: vi.fn(),
   upsertOAuthSession: vi.fn(),
 }));
 
@@ -40,7 +42,15 @@ vi.mock("@modelcontextprotocol/sdk/client/streamableHttp.js", () => ({
 }));
 
 vi.mock("../stdio-transport/process-managed-transport", () => ({
-  ProcessManagedStdioTransport: class {},
+  ProcessManagedStdioTransport: class {
+    close() {
+      return mocks.transportClose();
+    }
+
+    start() {
+      return mocks.transportStart();
+    }
+  },
 }));
 
 vi.mock("../../db/repositories", () => ({
@@ -69,7 +79,7 @@ vi.mock("./log-store", () => ({
 
 vi.mock("./server-error-tracker", () => ({
   serverErrorTracker: {
-    getServerMaxAttempts: vi.fn().mockResolvedValue(1),
+    getServerMaxAttempts: mocks.getServerMaxAttempts,
     isServerInErrorState: mocks.isServerInErrorState,
     recordConnectionFailure: mocks.recordConnectionFailure,
     resetServerErrorState: mocks.resetServerErrorState,
@@ -101,6 +111,17 @@ const SERVER: ServerParameters = {
     token_type: "Bearer",
     refresh_token: "RT_old",
   },
+};
+
+const STDIO_SERVER: ServerParameters = {
+  uuid: "00000000-0000-0000-0000-0000000000cc",
+  name: "missing-command",
+  description: "",
+  type: "STDIO",
+  stderr: "ignore",
+  command: "/nonexistent/binary",
+  created_at: "2026-08-23T00:00:00.000Z",
+  status: "ACTIVE",
 };
 
 describe("connectClientWithDeadline", () => {
@@ -137,6 +158,7 @@ describe("connectMetaMcpClient refresh retry", () => {
     vi.clearAllMocks();
     mocks.clientClose.mockResolvedValue(undefined);
     mocks.configTimeout.mockResolvedValue(100);
+    mocks.getServerMaxAttempts.mockResolvedValue(1);
     mocks.isServerInErrorState.mockResolvedValue(false);
     mocks.recordConnectionFailure.mockResolvedValue(undefined);
     mocks.resetServerErrorState.mockResolvedValue(undefined);
@@ -191,5 +213,52 @@ describe("connectMetaMcpClient refresh retry", () => {
       "upstream rejected the credentials; re-authorisation required",
       true,
     );
+  });
+});
+
+describe("connectMetaMcpClient terminal stdio spawn failure", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.clientClose.mockResolvedValue(undefined);
+    mocks.configTimeout.mockResolvedValue(100);
+    mocks.getServerMaxAttempts.mockResolvedValue(4);
+    mocks.isServerInErrorState.mockResolvedValue(false);
+    mocks.recordConnectionFailure.mockResolvedValue(undefined);
+    mocks.transportClose.mockResolvedValue(undefined);
+    mocks.sdkConnect.mockImplementation(async (transport: Transport) => {
+      await transport.start?.();
+    });
+  });
+
+  it("rejects an ENOENT spawn error on the first attempt without backoff", async () => {
+    const realNow = Date.now;
+    vi.useFakeTimers();
+    const setTimeoutSpy = vi.spyOn(globalThis, "setTimeout");
+    const spawnError = Object.assign(
+      new Error("spawn /nonexistent/binary ENOENT"),
+      { code: "ENOENT", syscall: "spawn /nonexistent/binary" },
+    );
+    mocks.transportStart.mockRejectedValue(spawnError);
+    const startedAt = realNow();
+
+    try {
+      const connection = connectMetaMcpClient({ ...STDIO_SERVER });
+      const rejection = expect(connection).rejects.toBe(spawnError);
+      await vi.advanceTimersByTimeAsync(5000);
+
+      expect(mocks.transportStart).toHaveBeenCalledOnce();
+      expect(setTimeoutSpy).not.toHaveBeenCalledWith(
+        expect.any(Function),
+        5000,
+      );
+      await rejection;
+      expect(realNow() - startedAt).toBeLessThan(500);
+      expect(mocks.recordConnectionFailure).toHaveBeenCalledWith(
+        STDIO_SERVER.uuid,
+        spawnError.message,
+      );
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
