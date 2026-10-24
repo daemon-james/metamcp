@@ -88,6 +88,9 @@ describe("tryRefreshUpstreamTokens", () => {
         refresh_token: "RT_old",
       }),
     });
+    // Open connections pick the new token up from the store.
+    const { getCurrentAccessToken } = await import("./access-token-store");
+    expect(getCurrentAccessToken(SERVER.uuid)).toBe("NEW");
   });
 
   it("returns no_session when no oauth_sessions row exists", async () => {

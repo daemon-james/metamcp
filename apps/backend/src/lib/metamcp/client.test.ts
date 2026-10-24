@@ -12,6 +12,7 @@ const mocks = vi.hoisted(() => ({
   recordConnectionFailure: vi.fn(),
   resetServerErrorState: vi.fn(),
   sdkConnect: vi.fn(),
+  transportOptions: vi.fn(),
   transportClose: vi.fn(),
   transportStart: vi.fn(),
   upsertOAuthSession: vi.fn(),
@@ -31,6 +32,10 @@ vi.mock("@modelcontextprotocol/sdk/client/index.js", () => ({
 
 vi.mock("@modelcontextprotocol/sdk/client/sse.js", () => ({
   SSEClientTransport: class {
+    constructor(_url: URL, options?: unknown) {
+      mocks.transportOptions(options);
+    }
+
     close() {
       return mocks.transportClose();
     }
@@ -38,7 +43,11 @@ vi.mock("@modelcontextprotocol/sdk/client/sse.js", () => ({
 }));
 
 vi.mock("@modelcontextprotocol/sdk/client/streamableHttp.js", () => ({
-  StreamableHTTPClientTransport: class {},
+  StreamableHTTPClientTransport: class {
+    constructor(_url: URL, options?: unknown) {
+      mocks.transportOptions(options);
+    }
+  },
 }));
 
 vi.mock("../stdio-transport/process-managed-transport", () => ({
@@ -90,8 +99,18 @@ vi.mock("./utils", () => ({
   resolveEnvVariables: vi.fn((env: Record<string, string>) => env),
 }));
 
+import {
+  clearCurrentAccessTokens,
+  getCurrentAccessToken,
+  setCurrentAccessToken,
+} from "../oauth-upstream/access-token-store";
 import { isUpstreamUnauthorizedError } from "../oauth-upstream/token-exchange";
-import { connectClientWithDeadline, connectMetaMcpClient } from "./client";
+import {
+  connectClientWithDeadline,
+  connectMetaMcpClient,
+  createMetaMcpClient,
+  recoverRejectedAccessToken,
+} from "./client";
 import {
   ConnectionTimeoutError,
   isTerminalConnectionError,
@@ -213,6 +232,142 @@ describe("connectMetaMcpClient refresh retry", () => {
       "upstream rejected the credentials; re-authorisation required",
       true,
     );
+  });
+});
+
+describe("createMetaMcpClient authentication", () => {
+  type TransportOptions = {
+    requestInit?: { headers?: Record<string, string> };
+    fetch?: unknown;
+    eventSourceInit?: { fetch?: unknown };
+  };
+  const lastTransportOptions = () =>
+    mocks.transportOptions.mock.lastCall?.[0] as TransportOptions | undefined;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it.each(["SSE", "STREAMABLE_HTTP"] as const)(
+    "keeps a static bearer token in the %s request headers",
+    (type) => {
+      createMetaMcpClient({
+        ...SERVER,
+        type,
+        oauth_tokens: null,
+        bearerToken: "STATIC",
+        headers: { "X-Api-Key": "k" },
+      });
+
+      const options = lastTransportOptions();
+      expect(options?.requestInit?.headers).toEqual({
+        "X-Api-Key": "k",
+        Authorization: "Bearer STATIC",
+      });
+      expect(options?.fetch).toBeUndefined();
+    },
+  );
+
+  it.each(["SSE", "STREAMABLE_HTTP"] as const)(
+    "adds the OAuth token per request on %s instead of fixing it at creation",
+    (type) => {
+      createMetaMcpClient({
+        ...SERVER,
+        type,
+        bearerToken: "STATIC",
+        headers: { "X-Api-Key": "k" },
+      });
+
+      const options = lastTransportOptions();
+      expect(options?.requestInit?.headers).toEqual({ "X-Api-Key": "k" });
+      expect(options?.fetch).toEqual(expect.any(Function));
+      if (type === "SSE") {
+        expect(options?.eventSourceInit?.fetch).toEqual(expect.any(Function));
+      }
+    },
+  );
+});
+
+describe("recoverRejectedAccessToken", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    clearCurrentAccessTokens();
+    mocks.configTimeout.mockResolvedValue(1000);
+    mocks.upsertOAuthSession.mockResolvedValue({});
+    mocks.findOAuthSession.mockResolvedValue({
+      mcp_server_uuid: SERVER.uuid,
+      client_information: {
+        client_id: "client-1",
+        token_endpoint: "https://auth.example.com/token",
+      },
+      tokens: {
+        access_token: "A",
+        token_type: "Bearer",
+        refresh_token: "RT",
+      },
+    });
+  });
+
+  it("uses a token another path already refreshed to, without a refresh", async () => {
+    setCurrentAccessToken(SERVER.uuid, "B");
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+
+    await expect(recoverRejectedAccessToken(SERVER, "A")).resolves.toBe("B");
+    expect(mocks.findOAuthSession).not.toHaveBeenCalled();
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("adopts a newer token found in the database", async () => {
+    setCurrentAccessToken(SERVER.uuid, "A");
+    mocks.findOAuthSession.mockResolvedValue({
+      mcp_server_uuid: SERVER.uuid,
+      tokens: { access_token: "C", token_type: "Bearer" },
+    });
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+
+    await expect(recoverRejectedAccessToken(SERVER, "A")).resolves.toBe("C");
+    expect(getCurrentAccessToken(SERVER.uuid)).toBe("C");
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("refreshes when the rejected token is still the newest, and shares that refresh", async () => {
+    let tokenPosts = 0;
+    vi.spyOn(globalThis, "fetch").mockImplementation((url, init) => {
+      if (init?.method === "POST") {
+        tokenPosts += 1;
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({ access_token: "B", token_type: "Bearer" }),
+            { status: 200, headers: { "Content-Type": "application/json" } },
+          ),
+        );
+      }
+      return Promise.resolve(new Response("", { status: 404 }));
+    });
+
+    const results = await Promise.all([
+      recoverRejectedAccessToken(SERVER, "A"),
+      recoverRejectedAccessToken(SERVER, "A"),
+    ]);
+
+    expect(results).toEqual(["B", "B"]);
+    expect(tokenPosts).toBe(1);
+    expect(getCurrentAccessToken(SERVER.uuid)).toBe("B");
+    // A request rejected with the old token after the refresh finished must
+    // not spend the rotated refresh token again.
+    await expect(recoverRejectedAccessToken(SERVER, "A")).resolves.toBe("B");
+    expect(tokenPosts).toBe(1);
+  });
+
+  it("gives up when there is no refresh token", async () => {
+    mocks.findOAuthSession.mockResolvedValue({
+      mcp_server_uuid: SERVER.uuid,
+      tokens: { access_token: "A", token_type: "Bearer" },
+    });
+
+    await expect(
+      recoverRejectedAccessToken(SERVER, "A"),
+    ).resolves.toBeUndefined();
   });
 });
 

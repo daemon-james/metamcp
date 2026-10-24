@@ -10,6 +10,10 @@ import logger from "@/utils/logger";
 import { oauthSessionsRepository } from "../../db/repositories";
 import { configService } from "../config.service";
 import {
+  getCurrentAccessToken,
+  setCurrentAccessToken,
+} from "../oauth-upstream/access-token-store";
+import {
   refreshIfExpiring,
   tryRefreshUpstreamTokens,
 } from "../oauth-upstream/refresh-on-401";
@@ -23,6 +27,7 @@ import {
 } from "./connection-errors";
 import { mergeSdkHeaders } from "./header-merge";
 import { metamcpLogStore } from "./log-store";
+import { createOAuthFetch } from "./oauth-fetch";
 import { serverErrorTracker } from "./server-error-tracker";
 import { resolveEnvVariables } from "./utils";
 
@@ -95,6 +100,73 @@ export const transformDockerUrl = (url: string): string => {
   return url;
 };
 
+/**
+ * Find a usable replacement for an access token the upstream just rejected on
+ * an open connection. In order of cost: a token another path has already
+ * moved on to, a token written to the database by someone else (a fresh
+ * authorization, or a refresh in another process), and finally a refresh of
+ * our own. The refresh is shared with any other caller already refreshing
+ * this server, which matters for providers that rotate refresh tokens.
+ */
+export async function recoverRejectedAccessToken(
+  serverParams: Pick<ServerParameters, "uuid" | "name" | "url">,
+  rejectedAccessToken: string,
+): Promise<string | undefined> {
+  const label = `${serverParams.name} (${serverParams.uuid})`;
+
+  const current = getCurrentAccessToken(serverParams.uuid);
+  if (current && current !== rejectedAccessToken) {
+    logger.info(
+      `[oauth] upstream 401 on open connection for ${label}; retrying with the token already refreshed`,
+    );
+    return current;
+  }
+
+  const session = await oauthSessionsRepository.findByMcpServerUuid(
+    serverParams.uuid,
+  );
+  const stored = session?.tokens?.access_token;
+  if (stored && stored !== rejectedAccessToken) {
+    setCurrentAccessToken(serverParams.uuid, stored);
+    logger.info(
+      `[oauth] upstream 401 on open connection for ${label}; retrying with the stored token`,
+    );
+    return stored;
+  }
+  if (!session?.tokens?.refresh_token) {
+    return undefined;
+  }
+
+  const refresh = await tryRefreshUpstreamTokens(serverParams);
+  if (refresh.status === "refreshed" && refresh.tokens?.access_token) {
+    logger.info(
+      `[oauth] upstream 401 on open connection for ${label}; refreshed and retrying`,
+    );
+    return refresh.tokens.access_token;
+  }
+  logger.warn(
+    `[oauth] upstream 401 on open connection for ${label} not recovered: ${refresh.status}${
+      refresh.error ? ` (${refresh.error})` : ""
+    }`,
+  );
+  return undefined;
+}
+
+// A per-request token fetch for servers authenticated with OAuth, or
+// undefined for every other server, whose static headers and bearer token
+// are fixed at creation as before.
+const createUpstreamOAuthFetch = (serverParams: ServerParameters) => {
+  const initialAccessToken = serverParams.oauth_tokens?.access_token;
+  if (!initialAccessToken) return undefined;
+  const { uuid, name, url } = serverParams;
+  return createOAuthFetch({
+    serverUuid: uuid,
+    initialAccessToken,
+    recover: (rejected) =>
+      recoverRejectedAccessToken({ uuid, name, url }, rejected),
+  });
+};
+
 export const createMetaMcpClient = (
   serverParams: ServerParameters,
 ): { client: Client | undefined; transport: Transport | undefined } => {
@@ -155,15 +227,29 @@ export const createMetaMcpClient = (
     };
 
     // Check for authentication - prioritize OAuth tokens, fallback to bearerToken
-    const authToken =
-      serverParams.oauth_tokens?.access_token || serverParams.bearerToken;
+    const oauthFetch = createUpstreamOAuthFetch(serverParams);
+    const authToken = oauthFetch ? undefined : serverParams.bearerToken;
     if (authToken) {
       headers["Authorization"] = `Bearer ${authToken}`;
     }
 
     const hasHeaders = Object.keys(headers).length > 0;
 
-    if (!hasHeaders) {
+    if (oauthFetch) {
+      // OAuth tokens expire while the connection is still in use, so the
+      // Authorization header is added per request; see createOAuthFetch.
+      transport = new SSEClientTransport(new URL(transformedUrl), {
+        requestInit: { headers },
+        fetch: oauthFetch,
+        eventSourceInit: {
+          fetch: (url, init) =>
+            oauthFetch(url, {
+              ...init,
+              headers: mergeSdkHeaders(init?.headers, headers),
+            }),
+        },
+      });
+    } else if (!hasHeaders) {
       transport = new SSEClientTransport(new URL(transformedUrl));
     } else {
       transport = new SSEClientTransport(new URL(transformedUrl), {
@@ -191,15 +277,22 @@ export const createMetaMcpClient = (
     };
 
     // Check for authentication - prioritize OAuth tokens, fallback to bearerToken
-    const authToken =
-      serverParams.oauth_tokens?.access_token || serverParams.bearerToken;
+    const oauthFetch = createUpstreamOAuthFetch(serverParams);
+    const authToken = oauthFetch ? undefined : serverParams.bearerToken;
     if (authToken) {
       headers["Authorization"] = `Bearer ${authToken}`;
     }
 
     const hasHeaders = Object.keys(headers).length > 0;
 
-    if (!hasHeaders) {
+    if (oauthFetch) {
+      // OAuth tokens expire while the connection is still in use, so the
+      // Authorization header is added per request; see createOAuthFetch.
+      transport = new StreamableHTTPClientTransport(new URL(transformedUrl), {
+        requestInit: { headers },
+        fetch: oauthFetch,
+      });
+    } else if (!hasHeaders) {
       transport = new StreamableHTTPClientTransport(new URL(transformedUrl));
     } else {
       transport = new StreamableHTTPClientTransport(new URL(transformedUrl), {
@@ -276,6 +369,7 @@ export const connectMetaMcpClient = async (
       );
       if (session?.tokens?.access_token) {
         serverParams.oauth_tokens = session.tokens;
+        setCurrentAccessToken(serverParams.uuid, session.tokens.access_token);
       }
     } catch (error) {
       // Non-fatal: fall back to whatever the caller supplied.

@@ -24,6 +24,7 @@ import { ServerParameters } from "@repo/zod-types";
 
 import { oauthSessionsRepository } from "../../db/repositories";
 import logger from "../../utils/logger";
+import { setCurrentAccessToken } from "./access-token-store";
 import { resolveAuthorizationServer } from "./discovery";
 import {
   isRefreshTokenKnownDead,
@@ -256,6 +257,9 @@ async function doRefresh(
     mcp_server_uuid: serverParams.uuid,
     tokens: newTokens,
   });
+  // Open connections read the token per request; this is what moves them on
+  // to the new one.
+  setCurrentAccessToken(serverParams.uuid, newTokens.access_token);
 
   logger.info(
     `[oauth] proxy refresh succeeded — server=${serverParams.uuid} ` +
