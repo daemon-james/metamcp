@@ -285,6 +285,59 @@ Using SSE
 
 For more details and alternative approaches, see [issue #76](https://github.com/metatool-ai/metamcp/issues/76#issuecomment-3046707532).
 
+### 🔄 Live Tool-List Reloading
+
+Connected clients pick up added, removed or changed MCP servers and tools
+without a MetaMCP restart and without starting a new session.
+
+- **What counts as a change**: a server added, removed, edited, mapped or
+  unmapped (through the UI or with direct SQL), a tool status or override
+  changed, or a backend that starts serving a different tool list (for example
+  a STDIO server respawned from a new build).
+- **How it is detected**: MetaMCP reads `mcp_servers`,
+  `namespace_server_mappings` and `namespace_tool_mappings` every 5 seconds and
+  compares fingerprints with the previous reading. It also hashes every tool
+  list it sees from a backend (on each new connection, when the backend sends
+  `list_changed`, and on each namespace `tools/list`) and compares it with the
+  last one from that server. A server whose connection settings changed, or
+  which was deleted, has its pooled connections retired, so the next use
+  reconnects with the current settings.
+- **What clients see**: changes are coalesced for 3 seconds (for at most 15
+  seconds in total), then every session of the affected namespace is sent
+  `notifications/tools/list_changed` on its server-to-client stream (the GET
+  stream, or the SSE stream). A session that has no open stream cannot be
+  told. If it neither reopens its stream nor calls `tools/list` within 10
+  seconds, it is ended as soon as it has no request in flight. Its next
+  request gets HTTP 404, and the client opens a new session and fetches the
+  current list. A tool call in progress is never cut off, and a session with
+  an open stream is never ended.
+- **Clients**:
+  - **Claude Code** re-fetches the list within milliseconds of the
+    notification, and the model sees added, renamed and removed tools in the
+    same conversation.
+  - **Codex** ignores the notification unless its experimental feature is on
+    (`[features]` `mcp_tool_list_changed = true` in `~/.codex/config.toml`).
+    With the feature on, it re-fetches before its next model request. With it
+    off, its list only updates in a new Codex session. Ending its session would
+    not help: after a 404 it re-initialises but keeps its old list.
+  - **Cursor**: the IDE's support for the notification is unreliable,
+    according to Cursor's forum, and the CLI ignores it.
+- **Detection lag**: configuration changes reach clients in about 3–8 seconds.
+  A respawned backend is noticed when MetaMCP reconnects to it: at once if a
+  client uses it, otherwise within the 60-second idle health check. For an
+  immediate update, call the manual reload at the end of a deploy.
+
+**Manual reload**: `POST /metamcp/<endpoint>/admin/reload-tools`, with the
+same API key as the MCP endpoint. It notifies the endpoint's namespace
+straight away and returns the number of sessions notified. From an agent on
+this machine:
+
+```bash
+curl -fsS -X POST -H "X-API-Key: $(jq -r '.mcpServers.metamcp.headers["X-API-Key"]' ~/.claude.json)" https://metamcp.devops.jaydeeco.com/metamcp/workstation/admin/reload-tools
+```
+
+The implementation is in `apps/backend/src/lib/metamcp/live-reload/`.
+
 ### 🔧 API Key Auth Troubleshooting
 
 - `?api_key=` param api key auth doesn't work for SSE. It only works for Streamable HTTP and OpenAPI.
