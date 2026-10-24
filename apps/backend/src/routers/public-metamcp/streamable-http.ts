@@ -376,7 +376,6 @@ streamableHttpRouter.post(
           res.status(404).json({
             error: "Session not found",
             message: `Transport not found for sessionId ${sessionId}`,
-            available_sessions: sessionManager.getSessionIds(),
             timestamp: new Date().toISOString(),
           });
         } else {
