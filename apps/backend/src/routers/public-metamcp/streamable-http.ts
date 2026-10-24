@@ -14,6 +14,7 @@ import logger from "@/utils/logger";
 
 import { buildAdminToolsOptions } from "../../lib/admin-mcp/build-admin-tools-options";
 import { extractClientHeaders } from "../../lib/metamcp/header-forwarding";
+import { toolListReloader } from "../../lib/metamcp/live-reload/live-reload";
 import { MetaMCPHandlerContext } from "../../lib/metamcp/metamcp-middleware/functional-middleware";
 import { metaMcpServerPool } from "../../lib/metamcp/metamcp-server-pool";
 import { SessionLifetimeManagerImpl } from "../../lib/session-lifetime-manager";
@@ -116,6 +117,11 @@ const cleanupSession = async (
     // Use provided transport or get from session manager
     const sessionTransport = transport || sessionManager.getSession(sessionId);
 
+    // Forget the session id before the asynchronous close, so a request that
+    // arrives meanwhile gets 404 instead of a transport that is going away.
+    sessionManager.removeSession(sessionId);
+    toolListReloader.detach(sessionId);
+
     if (sessionTransport) {
       logger.info(`Closing transport for session ${sessionId}`);
       await sessionTransport.close();
@@ -123,9 +129,6 @@ const cleanupSession = async (
     } else {
       logger.info(`No transport found for session ${sessionId}`);
     }
-
-    // Remove from session manager
-    sessionManager.removeSession(sessionId);
 
     // Clean up MetaMCP server pool session
     await metaMcpServerPool.cleanupSession(sessionId);
@@ -183,9 +186,13 @@ streamableHttpRouter.get(
         logger.info(`Found session ${sessionId}, handling request`);
         normalizeStreamableHttpAcceptHeader(req);
         beginSessionRequest(sessionId);
+        // handleRequest resolves when this GET stream closes; while it is
+        // open the session can be sent list_changed.
+        toolListReloader.streamOpened(sessionId);
         try {
           await transport.handleRequest(req, res);
         } finally {
+          toolListReloader.streamClosed(sessionId);
           endSessionRequest(sessionId);
         }
       }
@@ -316,6 +323,15 @@ streamableHttpRouter.post(
           res.type("application/json");
           // The stream was consumed by readJsonBody, so pass the parsed value.
           await transport.handleRequest(req, res, parsedBody);
+
+          // From here on the session is told when its tool list changes.
+          const sessionTransport = transport;
+          toolListReloader.attach(
+            newSessionId,
+            namespaceUuid,
+            sessionTransport,
+            () => cleanupSession(newSessionId, sessionTransport),
+          );
         } finally {
           endSessionRequest(newSessionId);
         }

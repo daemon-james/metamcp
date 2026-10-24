@@ -1,11 +1,15 @@
 import { isFlaggedErrorStatus } from "@repo/zod-types";
 import express from "express";
 
-import { authenticateApiKey } from "@/middleware/api-key-oauth.middleware";
+import {
+  ApiKeyAuthenticatedRequest,
+  authenticateApiKey,
+} from "@/middleware/api-key-oauth.middleware";
 import { lookupEndpoint } from "@/middleware/lookup-endpoint-middleware";
 import logger from "@/utils/logger";
 
 import { mcpServersRepository } from "../../db/repositories";
+import { toolListReloader } from "../../lib/metamcp/live-reload/live-reload";
 import { serverErrorTracker } from "../../lib/metamcp/server-error-tracker";
 import { initializeIdleServers } from "../../lib/startup";
 
@@ -80,6 +84,31 @@ adminRouter.post(
         message: error instanceof Error ? error.message : String(error),
       });
     }
+  },
+);
+
+/**
+ * POST /metamcp/:endpoint_name/admin/reload-tools
+ *
+ * Tells every connected session of the endpoint's namespace that its tool list
+ * changed, straight away. Changes are normally detected on their own (see
+ * lib/metamcp/live-reload); this is for when you want it now, e.g. at the end
+ * of a deploy script. Sessions with no open stream to receive the notification
+ * are ended once idle unless they re-fetch, so their clients re-initialise.
+ *
+ * Auth: Same API key as MCP endpoints (X-API-Key header)
+ */
+adminRouter.post(
+  "/:endpoint_name/admin/reload-tools",
+  lookupEndpoint,
+  authenticateApiKey,
+  (req, res) => {
+    const { namespaceUuid, endpointName } = req as ApiKeyAuthenticatedRequest;
+    const notified = toolListReloader.reloadNow(
+      namespaceUuid,
+      `manual reload via ${endpointName}`,
+    );
+    res.json({ success: true, namespaceUuid, sessionsNotified: notified });
   },
 );
 

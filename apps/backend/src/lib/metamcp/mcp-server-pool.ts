@@ -11,6 +11,7 @@ import {
   countTotalConnections,
 } from "./connection-counting";
 import { serverRequiresForwardedHeaders } from "./header-forwarding";
+import { watchConnectionTools } from "./live-reload/live-reload";
 import { metamcpLogStore } from "./log-store";
 import { serverErrorTracker } from "./server-error-tracker";
 import { isClientSharedWithOtherSessions } from "./shared-connection";
@@ -411,6 +412,20 @@ export class McpServerPool {
     if (!connectedClient) {
       return undefined;
     }
+
+    // A STDIO server that exits cleanly is not a crash (deploys hand over with
+    // SIGINT and exit 0), but its connection is gone all the same. Forget it,
+    // so the next use or the idle health check starts a fresh process instead
+    // of failing on the dead one first.
+    const previousOnClose = connectedClient.client.onclose;
+    connectedClient.client.onclose = () => {
+      previousOnClose?.();
+      this.forgetConnection(params.uuid, connectedClient);
+    };
+
+    // A respawned process may be serving a different build; compare its tool
+    // list with the last one seen from this server.
+    watchConnectionTools(params, connectedClient);
 
     return connectedClient;
   }
@@ -1075,6 +1090,33 @@ export class McpServerPool {
         this.sessionToServers[sessionId]?.delete(serverUuid);
       }
     }
+  }
+
+  /** Drop a connection that has closed from wherever the pool holds it. */
+  private forgetConnection(
+    serverUuid: string,
+    connection: ConnectedClient,
+  ): void {
+    if (this.idleSessions[serverUuid] === connection) {
+      delete this.idleSessions[serverUuid];
+    }
+    for (const [sessionId, servers] of Object.entries(this.activeSessions)) {
+      if (servers[serverUuid] === connection) {
+        delete servers[serverUuid];
+        this.sessionToServers[sessionId]?.delete(serverUuid);
+      }
+    }
+  }
+
+  /**
+   * Retire every pooled connection to a server whose connection settings were
+   * changed or which was deleted. The cached parameters go too, so nothing is
+   * respawned from the old settings: the next session to use the server
+   * reconnects with the parameters it reads from the database.
+   */
+  async retireServer(serverUuid: string): Promise<void> {
+    delete this.serverParamsCache[serverUuid];
+    await this.cleanupServerSessions(serverUuid);
   }
 
   /**

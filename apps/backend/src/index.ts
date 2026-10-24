@@ -106,6 +106,13 @@ async function start(): Promise<void> {
     await new Promise((resolve) => setTimeout(resolve, 3000)).then(
       initializeIdleServers,
     );
+
+    // Watch the configuration for changes that alter a namespace's tool
+    // list, and tell connected clients (lib/metamcp/live-reload).
+    const { mcpServerPool } = await import("./lib/metamcp");
+    const { startConfigWatch } =
+      await import("./lib/metamcp/live-reload/live-reload");
+    startConfigWatch((serverUuid) => mcpServerPool.retireServer(serverUuid));
   });
 }
 

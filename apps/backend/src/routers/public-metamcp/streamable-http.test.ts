@@ -11,6 +11,10 @@ const mocks = vi.hoisted(() => ({
   endPoolRequest: vi.fn(),
   buildAdminToolsOptions: vi.fn(),
   extractClientHeaders: vi.fn(),
+  attachReloader: vi.fn(),
+  detachReloader: vi.fn(),
+  streamOpened: vi.fn(),
+  streamClosed: vi.fn(),
 }));
 
 vi.mock("@modelcontextprotocol/sdk/server/streamableHttp.js", () => ({
@@ -57,6 +61,15 @@ vi.mock("../../lib/metamcp/header-forwarding", () => ({
   extractClientHeaders: mocks.extractClientHeaders,
 }));
 
+vi.mock("../../lib/metamcp/live-reload/live-reload", () => ({
+  toolListReloader: {
+    attach: mocks.attachReloader,
+    detach: mocks.detachReloader,
+    streamOpened: mocks.streamOpened,
+    streamClosed: mocks.streamClosed,
+  },
+}));
+
 vi.mock("../../lib/metamcp/metamcp-server-pool", () => ({
   metaMcpServerPool: {
     getServer: mocks.getServer,
@@ -79,7 +92,7 @@ type RouteHandler = (
   res: Record<string, unknown>,
 ) => Promise<void>;
 
-function getPostHandler(): RouteHandler {
+function getHandler(method: "get" | "post"): RouteHandler {
   const router = streamableHttpRouter as unknown as {
     stack: Array<{
       route?: {
@@ -91,10 +104,11 @@ function getPostHandler(): RouteHandler {
   };
   const route = router.stack.find(
     (layer) =>
-      layer.route?.path === "/:endpoint_name/mcp" && layer.route.methods.post,
+      layer.route?.path === "/:endpoint_name/mcp" &&
+      layer.route.methods[method],
   )?.route;
   if (!route) {
-    throw new Error("POST /:endpoint_name/mcp handler not found");
+    throw new Error(`${method} /:endpoint_name/mcp handler not found`);
   }
   return route.stack[route.stack.length - 1].handle;
 }
@@ -149,7 +163,7 @@ function makeResponse() {
 }
 
 describe("public Streamable HTTP session creation", () => {
-  const postHandler = getPostHandler();
+  const postHandler = getHandler("post");
 
   beforeEach(() => {
     for (const sessionId of sessionManager.getSessionIds()) {
@@ -260,5 +274,64 @@ describe("public Streamable HTTP session creation", () => {
     expect(mocks.transports[0].close).toHaveBeenCalledOnce();
     expect(sessionManager.getSessionIds()).not.toContain(sessionId);
     expect(mocks.cleanupPoolSession).toHaveBeenCalledWith(sessionId);
+  });
+
+  it("hands a new session to the tool-list reloader, whose end makes the id unknown", async () => {
+    const connect = vi.fn().mockResolvedValue(undefined);
+    mocks.getServer.mockResolvedValue({ server: { connect } });
+
+    await postHandler(
+      makeStreamRequest({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: {
+          protocolVersion: "2025-11-25",
+          capabilities: {},
+          clientInfo: { name: "test-client", version: "1.0.0" },
+        },
+      }),
+      makeResponse(),
+    );
+
+    const sessionId = mocks.getServer.mock.calls[0][0] as string;
+    expect(mocks.attachReloader).toHaveBeenCalledOnce();
+    const [attachedId, namespaceUuid, transport, end] =
+      mocks.attachReloader.mock.calls[0];
+    expect(attachedId).toBe(sessionId);
+    expect(namespaceUuid).toBe("namespace-1");
+    expect(transport).toBe(mocks.transports[0]);
+    expect(sessionManager.getSessionIds()).toContain(sessionId);
+
+    // Ending the session: its id is forgotten (so the next request is a 404)
+    // and the transport and pooled server are released.
+    await end();
+    expect(sessionManager.getSessionIds()).not.toContain(sessionId);
+    expect(mocks.transports[0].close).toHaveBeenCalledOnce();
+    expect(mocks.detachReloader).toHaveBeenCalledWith(sessionId);
+    expect(mocks.cleanupPoolSession).toHaveBeenCalledWith(sessionId);
+  });
+
+  it("marks the session's stream open for exactly as long as its GET lasts", async () => {
+    let finishStream: () => void = () => {};
+    const transport = {
+      close: vi.fn(),
+      handleRequest: vi.fn(
+        () => new Promise<void>((resolve) => (finishStream = resolve)),
+      ),
+    };
+    sessionManager.addSession("s-get", transport as never);
+    const pending = getHandler("get")(
+      { headers: { "mcp-session-id": "s-get", accept: "text/event-stream" } },
+      makeResponse(),
+    );
+
+    await vi.waitFor(() => expect(transport.handleRequest).toHaveBeenCalled());
+    expect(mocks.streamOpened).toHaveBeenCalledWith("s-get");
+    expect(mocks.streamClosed).not.toHaveBeenCalled();
+
+    finishStream();
+    await pending;
+    expect(mocks.streamClosed).toHaveBeenCalledWith("s-get");
   });
 });

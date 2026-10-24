@@ -62,6 +62,9 @@ vi.mock("../config.service", () => ({
 vi.mock("./fetch-metamcp", () => ({
   getMcpServers: mocks.getMcpServers,
 }));
+vi.mock("./live-reload/live-reload", () => ({
+  noteBackendTools: vi.fn().mockResolvedValue(undefined),
+}));
 vi.mock("./mcp-server-pool", () => ({
   mcpServerPool: mocks.pool,
 }));

@@ -34,6 +34,10 @@ vi.mock("../oauth-upstream/refresh-on-401", () => ({
 
 vi.mock("./client", () => ({ connectMetaMcpClient }));
 
+vi.mock("./live-reload/live-reload", () => ({
+  watchConnectionTools: vi.fn(),
+}));
+
 vi.mock("./log-store", () => ({
   metamcpLogStore: { addLog: vi.fn() },
 }));
@@ -228,5 +232,35 @@ describe("McpServerPool connection caps", () => {
       pool.getSession("replacement", "forwarded-server", params),
     ).resolves.toBeDefined();
     expect(connectMetaMcpClient).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("McpServerPool closed connections", () => {
+  beforeEach(async () => {
+    await pool.cleanupAll();
+    connectMetaMcpClient.mockReset();
+    setCaps(2, 100);
+  });
+
+  afterEach(async () => {
+    await pool.cleanupAll();
+  });
+
+  it("forgets a connection whose backend exited, so the next use reconnects", async () => {
+    // A deploy SIGINTs the old process, which exits 0: no crash is reported.
+    let clientNumber = 0;
+    connectMetaMcpClient.mockImplementation(async () => {
+      clientNumber += 1;
+      return makeClient(`exited-${clientNumber}`);
+    });
+    const server = makeServer("exits-cleanly");
+
+    const first = await pool.getSession("session-1", server.uuid, server);
+    expect(first).toBeDefined();
+    (first as ConnectedClient).client.onclose?.();
+
+    const second = await pool.getSession("session-1", server.uuid, server);
+    expect(second).toBeDefined();
+    expect(second).not.toBe(first);
   });
 });

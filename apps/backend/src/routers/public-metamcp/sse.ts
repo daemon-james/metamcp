@@ -12,6 +12,7 @@ import logger from "@/utils/logger";
 
 import { buildAdminToolsOptions } from "../../lib/admin-mcp/build-admin-tools-options";
 import { extractClientHeaders } from "../../lib/metamcp/header-forwarding";
+import { toolListReloader } from "../../lib/metamcp/live-reload/live-reload";
 import { MetaMCPHandlerContext } from "../../lib/metamcp/metamcp-middleware/functional-middleware";
 import { metaMcpServerPool } from "../../lib/metamcp/metamcp-server-pool";
 import { SessionLifetimeManagerImpl } from "../../lib/session-lifetime-manager";
@@ -53,6 +54,7 @@ const cleanupSession = async (sessionId: string, transport?: Transport) => {
 
     // Remove from session manager
     sessionManager.removeSession(sessionId);
+    toolListReloader.detach(sessionId);
 
     // Clean up MetaMCP server pool session
     await metaMcpServerPool.cleanupSession(sessionId);
@@ -128,6 +130,14 @@ sseRouter.get(
 
       try {
         await mcpServerInstance.server.connect(webAppTransport);
+        // The SSE stream is the session, so it can always be notified.
+        toolListReloader.attach(
+          sessionId,
+          namespaceUuid,
+          webAppTransport,
+          () => cleanupSession(sessionId),
+          { streamOpen: true },
+        );
       } finally {
         sessionManager.endRequest(sessionId);
         metaMcpServerPool.endRequest(sessionId);
