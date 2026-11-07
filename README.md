@@ -296,21 +296,22 @@ without a MetaMCP restart and without starting a new session.
   a STDIO server respawned from a new build).
 - **How it is detected**: MetaMCP reads `mcp_servers`,
   `namespace_server_mappings` and `namespace_tool_mappings` every 5 seconds and
-  compares fingerprints with the previous reading. It also hashes every tool
-  list it sees from a backend (on each new connection, when the backend sends
-  `list_changed`, and on each namespace `tools/list`) and compares it with the
-  last one from that server. A server whose connection settings changed, or
+  compares fingerprints with the previous reading. It also hashes each pooled
+  connection's tool list, when the connection opens and when the backend sends
+  `list_changed`. Lists are compared per connection, never across connections:
+  a connection whose list changed counts, and so does a new connection serving
+  a list no live connection of that server serves. Two pooled connections that
+  serve different lists (for example two `uvx pkg@latest` processes started
+  either side of a release) are reported once, not on every listing. A server whose connection settings changed, or
   which was deleted, has its pooled connections retired, so the next use
   reconnects with the current settings.
 - **What clients see**: changes are coalesced for 3 seconds (for at most 15
   seconds in total), then every session of the affected namespace is sent
   `notifications/tools/list_changed` on its server-to-client stream (the GET
   stream, or the SSE stream). A session that has no open stream cannot be
-  told. If it neither reopens its stream nor calls `tools/list` within 10
-  seconds, it is ended as soon as it has no request in flight. Its next
-  request gets HTTP 404, and the client opens a new session and fetches the
-  current list. A tool call in progress is never cut off, and a session with
-  an open stream is never ended.
+  told then; it is sent the notification when its stream reopens, and until
+  then it keeps the list it has. A session is never ended because its tools
+  changed.
 - **Clients**:
   - **Claude Code** re-fetches the list within milliseconds of the
     notification, and the model sees added, renamed and removed tools in the
@@ -318,8 +319,7 @@ without a MetaMCP restart and without starting a new session.
   - **Codex** ignores the notification unless its experimental feature is on
     (`[features]` `mcp_tool_list_changed = true` in `~/.codex/config.toml`).
     With the feature on, it re-fetches before its next model request. With it
-    off, its list only updates in a new Codex session. Ending its session would
-    not help: after a 404 it re-initialises but keeps its old list.
+    off, its list only updates in a new Codex session.
   - **Cursor**: the IDE's support for the notification is unreliable,
     according to Cursor's forum, and the CLI ignores it.
 - **Detection lag**: configuration changes reach clients in about 3–8 seconds.

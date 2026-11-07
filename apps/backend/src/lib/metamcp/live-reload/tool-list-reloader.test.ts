@@ -48,9 +48,8 @@ describe("ToolListReloader", () => {
 
   const attach = (sessionId: string, namespaceUuid = NS) => {
     const transport = new FakeTransport();
-    const end = vi.fn(async () => {});
-    reloader.attach(sessionId, namespaceUuid, transport, end);
-    return { transport, end };
+    reloader.attach(sessionId, namespaceUuid, transport);
+    return { transport };
   };
 
   beforeEach(() => {
@@ -59,7 +58,6 @@ describe("ToolListReloader", () => {
     reloader = new ToolListReloader({
       debounceMs: 3_000,
       maxDelayMs: 15_000,
-      refetchWindowMs: 10_000,
       beforeNotify,
     });
   });
@@ -133,213 +131,91 @@ describe("ToolListReloader", () => {
       ]);
     });
 
-    it("keeps a session that re-fetches tools/list within the window", async () => {
-      const a = attach("a");
-      reloader.reloadNow(NS, "manual");
-
-      a.transport.request(1, "tools/list");
-      await a.transport.respond(1);
-      await vi.advanceTimersByTimeAsync(60_000);
-
-      expect(a.end).not.toHaveBeenCalled();
-    });
-
-    it("does not throw when a session cannot be sent the notification", async () => {
+    it("does not throw when a session cannot be sent the notification", () => {
       const a = attach("a");
       a.transport.failSends = true;
       expect(() => reloader.reloadNow(NS, "manual")).not.toThrow();
-      // ...and the refetch window still deals with it.
-      await vi.advanceTimersByTimeAsync(10_001);
-      expect(a.end).toHaveBeenCalledOnce();
     });
 
-    it("forgets a detached session", async () => {
-      const a = attach("a");
-      reloader.reloadNow(NS, "manual");
+    it("forgets a detached session", () => {
+      attach("a");
       reloader.detach("a");
-      await vi.advanceTimersByTimeAsync(60_000);
-      expect(a.end).not.toHaveBeenCalled();
       expect(reloader.reloadNow(NS, "manual")).toBe(0);
     });
   });
 
-  // Sessions in this block have no open stream, so the notification cannot
-  // reach them; see "sessions with an open stream" below for the others.
-  describe("idle-gated session termination", () => {
-    it("ends an idle session that did not re-fetch once the window passes", async () => {
+  describe("sessions without an open stream", () => {
+    it("never ends a session, whatever it does", async () => {
+      // Ending sessions cut agents off mid-task; Cursor's CLI never recovers.
+      const closed = vi.fn();
       const a = attach("a");
-      reloader.reloadNow(NS, "manual");
-
-      await vi.advanceTimersByTimeAsync(9_999);
-      expect(a.end).not.toHaveBeenCalled();
-
-      await vi.advanceTimersByTimeAsync(2);
-      expect(a.end).toHaveBeenCalledOnce();
-      expect(reloader.sessionCounts()).toEqual({});
-    });
-
-    it("waits for an in-flight call to return before ending the session", async () => {
-      const a = attach("a");
-      a.transport.request(7, "tools/call");
-      reloader.reloadNow(NS, "manual");
-
-      await vi.advanceTimersByTimeAsync(60_000);
-      expect(a.end).not.toHaveBeenCalled();
-
-      await a.transport.respond(7);
-      expect(a.transport.sent.at(-1)).toEqual({
-        jsonrpc: "2.0",
-        id: 7,
-        result: {},
-      });
-      await vi.advanceTimersByTimeAsync(1);
-      expect(a.end).toHaveBeenCalledOnce();
-    });
-
-    it("waits for every concurrent call, not just the first", async () => {
-      const a = attach("a");
+      a.transport.close = closed;
       a.transport.request(1, "tools/call");
-      a.transport.request(2, "tools/call");
-      reloader.reloadNow(NS, "manual");
-      await vi.advanceTimersByTimeAsync(10_001);
-
-      await a.transport.respond(1);
-      await vi.advanceTimersByTimeAsync(1);
-      expect(a.end).not.toHaveBeenCalled();
-
-      await a.transport.respond(2);
-      await vi.advanceTimersByTimeAsync(1);
-      expect(a.end).toHaveBeenCalledOnce();
-    });
-
-    it("does not end a session when a call arrives just as it was about to be ended", async () => {
-      const a = attach("a");
-      reloader.reloadNow(NS, "manual");
-      await vi.advanceTimersByTimeAsync(10_000);
-
-      // The end is deferred one tick; a call slips in before it runs.
-      a.transport.request(3, "tools/call");
-      await vi.advanceTimersByTimeAsync(1);
-      expect(a.end).not.toHaveBeenCalled();
-
-      await a.transport.respond(3);
-      await vi.advanceTimersByTimeAsync(1);
-      expect(a.end).toHaveBeenCalledOnce();
-    });
-
-    it("spares an overdue session that re-fetches before it goes idle", async () => {
-      const a = attach("a");
-      a.transport.request(1, "tools/call");
-      reloader.reloadNow(NS, "manual");
-      await vi.advanceTimersByTimeAsync(10_001);
-
-      a.transport.request(2, "tools/list");
-      await a.transport.respond(2);
+      for (let i = 0; i < 5; i += 1) {
+        reloader.reloadNow(NS, "manual");
+        await vi.advanceTimersByTimeAsync(60_000);
+      }
       await a.transport.respond(1);
       await vi.advanceTimersByTimeAsync(60_000);
-
-      expect(a.end).not.toHaveBeenCalled();
+      expect(closed).not.toHaveBeenCalled();
+      expect(reloader.sessionCounts()).toEqual({ [NS]: 1 });
     });
 
-    it("does not count client notifications as work in flight", async () => {
+    it("re-sends a missed notification when the stream comes back", () => {
+      // Claude Code reopens its GET stream about a second after it drops.
       const a = attach("a");
-      a.transport.onmessage?.({
-        jsonrpc: "2.0",
-        method: "notifications/initialized",
-      });
       reloader.reloadNow(NS, "manual");
-      await vi.advanceTimersByTimeAsync(10_001);
-      expect(a.end).toHaveBeenCalledOnce();
+      reloader.streamOpened("a");
+      expect(a.transport.listChangedCount()).toBe(2);
+
+      // Only once: a later reopen with nothing missed sends nothing.
+      reloader.streamClosed("a");
+      reloader.streamOpened("a");
+      expect(a.transport.listChangedCount()).toBe(2);
     });
 
-    it("gives a fresh window when a second change arrives", async () => {
+    it("does not re-send to a session that listed its tools in the meantime", () => {
       const a = attach("a");
-      reloader.reloadNow(NS, "first");
-      await vi.advanceTimersByTimeAsync(8_000);
-      reloader.reloadNow(NS, "second");
-      await vi.advanceTimersByTimeAsync(8_000);
-      expect(a.end).not.toHaveBeenCalled();
-
+      reloader.reloadNow(NS, "manual");
       a.transport.request(1, "tools/list");
-      await vi.advanceTimersByTimeAsync(60_000);
-      expect(a.end).not.toHaveBeenCalled();
+      reloader.streamOpened("a");
+      expect(a.transport.listChangedCount()).toBe(1);
     });
   });
 
   describe("sessions with an open stream", () => {
-    it("tells a session with an open stream and never ends it, re-fetch or not", async () => {
-      // Codex ignores list_changed by default and keeps its old list even
-      // after a 404 and re-initialise, so ending it would fix nothing.
+    it("tells a session with an open stream once and does not re-send", () => {
       const a = attach("a");
       reloader.streamOpened("a");
       reloader.reloadNow(NS, "manual");
-
-      await vi.advanceTimersByTimeAsync(60_000);
+      reloader.streamClosed("a");
+      reloader.streamOpened("a");
       expect(a.transport.listChangedCount()).toBe(1);
-      expect(a.end).not.toHaveBeenCalled();
     });
 
-    it("treats an SSE session (attached with its stream open) the same way", async () => {
+    it("treats an SSE session (attached with its stream open) the same way", () => {
       const transport = new FakeTransport();
-      const end = vi.fn(async () => {});
-      reloader.attach("sse", NS, transport, end, { streamOpen: true });
+      reloader.attach("sse", NS, transport, { streamOpen: true });
       reloader.reloadNow(NS, "manual");
-      await vi.advanceTimersByTimeAsync(60_000);
       expect(transport.listChangedCount()).toBe(1);
-      expect(end).not.toHaveBeenCalled();
     });
 
-    it("counts a stream opened before the session was attached", async () => {
+    it("counts a stream opened before the session was attached", () => {
       reloader.streamOpened("a");
       const a = attach("a");
       reloader.reloadNow(NS, "manual");
-      await vi.advanceTimersByTimeAsync(60_000);
-      expect(a.end).not.toHaveBeenCalled();
-    });
-
-    it("re-sends a missed notification when the stream comes back within the window", async () => {
-      // Claude Code reopens its GET stream about a second after it drops.
-      const a = attach("a");
-      reloader.reloadNow(NS, "manual");
-      await vi.advanceTimersByTimeAsync(1_000);
-
       reloader.streamOpened("a");
-      expect(a.transport.listChangedCount()).toBe(2);
-      await vi.advanceTimersByTimeAsync(60_000);
-      expect(a.end).not.toHaveBeenCalled();
+      expect(a.transport.listChangedCount()).toBe(1);
     });
 
-    it("spares an overdue session still busy with a call if its stream comes back", async () => {
-      const a = attach("a");
-      a.transport.request(1, "tools/call");
-      reloader.reloadNow(NS, "manual");
-      await vi.advanceTimersByTimeAsync(10_001);
-
-      reloader.streamOpened("a");
-      await a.transport.respond(1);
-      await vi.advanceTimersByTimeAsync(60_000);
-      expect(a.end).not.toHaveBeenCalled();
-      expect(a.transport.listChangedCount()).toBe(2);
-    });
-
-    it("keeps the stream open when a refused second GET closes", async () => {
+    it("keeps the stream open when a refused second GET closes", () => {
       const a = attach("a");
       reloader.streamOpened("a");
       reloader.streamOpened("a"); // second GET, answered 409
       reloader.streamClosed("a");
       reloader.reloadNow(NS, "manual");
-      await vi.advanceTimersByTimeAsync(60_000);
-      expect(a.end).not.toHaveBeenCalled();
-    });
-
-    it("ends a session whose stream closed and that did not re-fetch", async () => {
-      // A client that went away without DELETE: its GET stream is gone.
-      const a = attach("a");
       reloader.streamOpened("a");
-      reloader.streamClosed("a");
-      reloader.reloadNow(NS, "manual");
-      await vi.advanceTimersByTimeAsync(10_001);
-      expect(a.end).toHaveBeenCalledOnce();
+      expect(a.transport.listChangedCount()).toBe(1);
     });
   });
 });

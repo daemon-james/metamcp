@@ -276,7 +276,7 @@ describe("public Streamable HTTP session creation", () => {
     expect(mocks.cleanupPoolSession).toHaveBeenCalledWith(sessionId);
   });
 
-  it("hands a new session to the tool-list reloader, whose end makes the id unknown", async () => {
+  it("hands a new session to the tool-list reloader, which cannot end it", async () => {
     const connect = vi.fn().mockResolvedValue(undefined);
     mocks.getServer.mockResolvedValue({ server: { connect } });
 
@@ -296,20 +296,13 @@ describe("public Streamable HTTP session creation", () => {
 
     const sessionId = mocks.getServer.mock.calls[0][0] as string;
     expect(mocks.attachReloader).toHaveBeenCalledOnce();
-    const [attachedId, namespaceUuid, transport, end] =
-      mocks.attachReloader.mock.calls[0];
+    const args = mocks.attachReloader.mock.calls[0];
+    expect(args).toHaveLength(3);
+    const [attachedId, namespaceUuid, transport] = args;
     expect(attachedId).toBe(sessionId);
     expect(namespaceUuid).toBe("namespace-1");
     expect(transport).toBe(mocks.transports[0]);
     expect(sessionManager.getSessionIds()).toContain(sessionId);
-
-    // Ending the session: its id is forgotten (so the next request is a 404)
-    // and the transport and pooled server are released.
-    await end();
-    expect(sessionManager.getSessionIds()).not.toContain(sessionId);
-    expect(mocks.transports[0].close).toHaveBeenCalledOnce();
-    expect(mocks.detachReloader).toHaveBeenCalledWith(sessionId);
-    expect(mocks.cleanupPoolSession).toHaveBeenCalledWith(sessionId);
   });
 
   it("marks the session's stream open for exactly as long as its GET lasts", async () => {

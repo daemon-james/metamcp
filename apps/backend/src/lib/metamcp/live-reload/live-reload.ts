@@ -5,9 +5,11 @@
 //     the previous reading (config-snapshot.ts). Catches servers added,
 //     removed, edited, mapped/unmapped and tool overrides changed, whether
 //     through the UI or direct SQL.
-//   - backends: every tool list seen from a backend is hashed and compared with
-//     the last one from that server (backend-tools-watch.ts). Catches a
-//     respawned process serving a different build.
+//   - backends: each connection's tool list is hashed when the connection
+//     opens and whenever the backend says its list changed, and compared per
+//     connection (backend-tools-watch.ts). Catches a respawned process serving
+//     a different build without mistaking two pooled connections that serve
+//     different lists for a change.
 // Both end in `toolListReloader.changed(namespace)`, which coalesces bursts and
 // brings every connected session up to date (tool-list-reloader.ts).
 
@@ -40,7 +42,6 @@ const BACKEND_LIST_TIMEOUT_MS = 15_000;
 export const toolListReloader = new ToolListReloader({
   debounceMs: 3_000,
   maxDelayMs: 15_000,
-  refetchWindowMs: 10_000,
   // Both caches can hold a tool's old status or override; the persistent
   // override entries never expire on their own.
   beforeNotify: (namespaceUuid) => {
@@ -49,17 +50,18 @@ export const toolListReloader = new ToolListReloader({
   },
 });
 
-const backendToolsWatch = new BackendToolsWatch();
+const backendToolsWatch = new BackendToolsWatch<ConnectedClient>();
 
-/** Compare a tool list just fetched from a backend with the last one. */
-export async function noteBackendTools(
+/** Compare a tool list just fetched on one connection with what it served. */
+async function noteBackendTools(
   params: ServerParameters,
+  connected: ConnectedClient,
   tools: Tool[],
 ): Promise<void> {
   // Forwarded headers carry each caller's own credentials, so different
   // sessions may legitimately see different lists from the same server.
   if (serverRequiresForwardedHeaders(params)) return;
-  if (!backendToolsWatch.observe(params.uuid, tools)) return;
+  if (!backendToolsWatch.observe(params.uuid, connected, tools)) return;
 
   const namespaceUuids =
     await namespaceMappingsRepository.findNamespacesByServerUuid(params.uuid);
@@ -91,7 +93,7 @@ export function watchConnectionTools(
       tools.push(...page.tools);
       cursor = page.nextCursor;
     } while (cursor);
-    await noteBackendTools(params, tools);
+    await noteBackendTools(params, connected, tools);
   };
   const run = () => {
     check().catch((error) => {
@@ -106,6 +108,11 @@ export function watchConnectionTools(
     ToolListChangedNotificationSchema,
     async () => run(),
   );
+  const previousOnClose = connected.client.onclose;
+  connected.client.onclose = () => {
+    previousOnClose?.();
+    backendToolsWatch.forget(params.uuid, connected);
+  };
   run();
 }
 

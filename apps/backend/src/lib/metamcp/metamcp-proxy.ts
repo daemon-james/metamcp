@@ -38,7 +38,6 @@ import { ConnectedClient } from "./client";
 import { getMcpServers } from "./fetch-metamcp";
 import { extractForwardedHeaders, mergeHeaders } from "./header-forwarding";
 import { requestWithSessionRecovery } from "./list-handler-recovery";
-import { noteBackendTools } from "./live-reload/live-reload";
 import { mcpServerPool } from "./mcp-server-pool";
 import { createAuditCallToolMiddleware } from "./metamcp-middleware/audit-requests.functional";
 import {
@@ -89,11 +88,7 @@ async function getListRequestOptions(): Promise<RequestOptions> {
     configService.getMcpMaxTotalTimeout(),
   ]);
 
-  const listBound = Math.min(
-    timeout,
-    maxTotalTimeout,
-    LIST_TIMEOUT_CEILING_MS,
-  );
+  const listBound = Math.min(timeout, maxTotalTimeout, LIST_TIMEOUT_CEILING_MS);
 
   return {
     resetTimeoutOnProgress,
@@ -416,15 +411,6 @@ export const createServer = async (
           console.log(
             `[DEBUG-TOOLS] ⏱️  Fetched ${allServerTools.length} tools from ${serverName} in ${(performance.now() - toolFetchStart).toFixed(2)}ms`,
           );
-
-          // Other sessions of this namespace still hold the old list if this
-          // backend's tools changed since they last looked.
-          noteBackendTools(params, allServerTools).catch((error) => {
-            logger.warn(
-              `Tool list change check failed for ${serverName}:`,
-              error,
-            );
-          });
 
           // Save original tools to database (before middleware processing)
           // This ensures we only save the actual tool names, not override names

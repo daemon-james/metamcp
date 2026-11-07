@@ -330,7 +330,6 @@ streamableHttpRouter.post(
             newSessionId,
             namespaceUuid,
             sessionTransport,
-            () => cleanupSession(newSessionId, sessionTransport),
           );
         } finally {
           endSessionRequest(newSessionId);

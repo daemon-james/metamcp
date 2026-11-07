@@ -131,13 +131,9 @@ sseRouter.get(
       try {
         await mcpServerInstance.server.connect(webAppTransport);
         // The SSE stream is the session, so it can always be notified.
-        toolListReloader.attach(
-          sessionId,
-          namespaceUuid,
-          webAppTransport,
-          () => cleanupSession(sessionId),
-          { streamOpen: true },
-        );
+        toolListReloader.attach(sessionId, namespaceUuid, webAppTransport, {
+          streamOpen: true,
+        });
       } finally {
         sessionManager.endRequest(sessionId);
         metaMcpServerPool.endRequest(sessionId);
