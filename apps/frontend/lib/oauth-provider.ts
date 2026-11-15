@@ -93,7 +93,13 @@ class DbOAuthClientProvider implements OAuthClientProvider {
         const result = await vanillaTrpcClient.frontend.oauth.get.query({
           mcp_server_uuid: this.mcpServerUuid,
         });
-        if (result.success && result.data?.client_information) {
+        // A cleared registration is stored as `{}` (the column is NOT
+        // NULL). Treat it as none so the backend registers a new client.
+        if (
+          result.success &&
+          (result.data?.client_information as { client_id?: string } | null)
+            ?.client_id
+        ) {
           return await OAuthClientInformationSchema.parseAsync(
             result.data.client_information,
           );
@@ -404,6 +410,36 @@ class DbOAuthClientProvider implements OAuthClientProvider {
         console.error("Error invalidating OAuth credentials:", error);
       }
     }
+  }
+
+  // Reauthenticate button: forget the stored sign-in so the next auth()
+  // goes to the provider's login page. A dynamically registered client is
+  // dropped too, so a registration the provider has since deleted (Sentry
+  // answers "Invalid client_id") is replaced by a fresh one. A client
+  // without client_id_issued_at may have been set up by hand, so it stays.
+  async forgetSignIn() {
+    let dynamicClient = false;
+    if (await this.serverExists()) {
+      const result = await vanillaTrpcClient.frontend.oauth.get.query({
+        mcp_server_uuid: this.mcpServerUuid,
+      });
+      const info = result.success
+        ? (result.data?.client_information as
+            | { client_id?: string; client_id_issued_at?: number }
+            | null
+            | undefined)
+        : undefined;
+      dynamicClient = Boolean(
+        info?.client_id && info.client_id_issued_at !== undefined,
+      );
+    }
+
+    if (dynamicClient) {
+      await this.invalidateCredentials("all");
+      return;
+    }
+    await this.invalidateCredentials("tokens");
+    await this.invalidateCredentials("verifier");
   }
 
   clear() {

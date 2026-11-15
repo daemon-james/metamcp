@@ -666,36 +666,46 @@ export function useConnection({
   // Connect click when the stored grant is dead. Page load must not
   // call this. Retrying the proxy with those tokens cannot succeed, so
   // skip that hop and send the user to the upstream login.
-  const reauthorize = useMemoizedFn(async (): Promise<void> => {
-    if (!enabled) {
-      console.warn("Cannot reauthorize: useConnection hook is disabled");
-      setConnectionStatus("disconnected");
-      return;
-    }
-
-    setConnectionStatus("connecting");
-    sessionStorage.setItem(SESSION_KEYS.SERVER_URL, url || "");
-    sessionStorage.setItem(SESSION_KEYS.MCP_SERVER_UUID, mcpServerUuid);
-
-    try {
-      await authProvider.invalidateCredentials("tokens");
-      const result = await auth(authProvider, {
-        serverUrl: url || "",
-      });
-      if (result === "AUTHORIZED") {
-        return connect();
+  //
+  // `fresh` is the Reauthenticate button: it works while the current
+  // sign-in is still valid, and also drops a dynamically registered
+  // client so the provider issues a new one.
+  const reauthorize = useMemoizedFn(
+    async (options: { fresh?: boolean } = {}): Promise<void> => {
+      if (!enabled) {
+        console.warn("Cannot reauthorize: useConnection hook is disabled");
+        setConnectionStatus("disconnected");
+        return;
       }
-      // REDIRECT: navigation is in progress.
-    } catch (error) {
-      console.error("Failed to start OAuth re-authorization:", error);
-      toast.error(
-        error instanceof Error
-          ? error.message
-          : "Failed to start authorization",
-      );
-      setConnectionStatus("error");
-    }
-  });
+
+      setConnectionStatus("connecting");
+      sessionStorage.setItem(SESSION_KEYS.SERVER_URL, url || "");
+      sessionStorage.setItem(SESSION_KEYS.MCP_SERVER_UUID, mcpServerUuid);
+
+      try {
+        if (options.fresh) {
+          await authProvider.forgetSignIn();
+        } else {
+          await authProvider.invalidateCredentials("tokens");
+        }
+        const result = await auth(authProvider, {
+          serverUrl: url || "",
+        });
+        if (result === "AUTHORIZED") {
+          return connect();
+        }
+        // REDIRECT: navigation is in progress.
+      } catch (error) {
+        console.error("Failed to start OAuth re-authorization:", error);
+        toast.error(
+          error instanceof Error
+            ? error.message
+            : "Failed to start authorization",
+        );
+        setConnectionStatus("error");
+      }
+    },
+  );
 
   const disconnect = useMemoizedFn(async () => {
     try {

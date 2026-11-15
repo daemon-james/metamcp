@@ -224,6 +224,7 @@
     "serverError": "Server Error",
     "connecting": "Connecting...",
     "reconnect": "Reconnect",
+    "reauthenticate": "Reauthenticate",
     "connect": "Connect",
     "connectToManageTools": "Connect to MCP server to manage tools",
     "connectingToServer": "Connecting to MCP server...",

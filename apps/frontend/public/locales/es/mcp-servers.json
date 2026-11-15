@@ -203,6 +203,7 @@
     "serverError": "Error del Server",
     "connecting": "Conectando...",
     "reconnect": "Reconectar",
+    "reauthenticate": "Volver a autenticar",
     "connect": "Conectar",
     "connectToManageTools": "Conecte al MCP server para administrar tools",
     "connectingToServer": "Conectando al MCP server...",

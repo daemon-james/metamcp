@@ -66,8 +66,8 @@ export function McpServersList({ onRefresh }: McpServersListProps) {
   const router = useRouter();
   const [sorting, setSorting] = useState<SortingState>([
     {
-      id: "created_at",
-      desc: true,
+      id: "name",
+      desc: false,
     },
   ]);
   const [globalFilter, setGlobalFilter] = useState("");

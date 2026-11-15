@@ -210,6 +210,7 @@
     "connectionError": "连接错误",
     "connecting": "连接中...",
     "reconnect": "重新连接",
+    "reauthenticate": "重新认证",
     "connect": "连接",
     "connectToManageTools": "连接到 MCP 服务器以管理工具",
     "connectingToServer": "正在连接到 MCP 服务器...",

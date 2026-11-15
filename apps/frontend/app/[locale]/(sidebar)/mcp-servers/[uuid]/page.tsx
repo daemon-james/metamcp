@@ -142,6 +142,26 @@ export default function McpServerDetailPage({
     ? serverResponse.data
     : undefined;
 
+  // A remote server that has signed in with OAuth before gets a
+  // Reauthenticate button, so the user can start a fresh sign-in while
+  // the current one still works.
+  const isRemote =
+    server?.type === McpServerTypeEnum.enum.STREAMABLE_HTTP ||
+    server?.type === McpServerTypeEnum.enum.SSE;
+  const { data: oauthSessionResponse } = trpc.frontend.oauth.get.useQuery(
+    { mcp_server_uuid: uuid },
+    { enabled: isRemote },
+  );
+  const oauthSession = oauthSessionResponse?.success
+    ? oauthSessionResponse.data
+    : undefined;
+  const usesOAuth = Boolean(
+    isRemote &&
+    oauthSession &&
+    ((oauthSession.client_information as { client_id?: string } | null)
+      ?.client_id ||
+      oauthSession.tokens),
+  );
 
   // Keep the connection hook enabled in ERROR state so the Connect button can
   // recover the backend state and immediately establish a fresh connection.
@@ -506,6 +526,20 @@ export default function McpServerDetailPage({
                     ? t("mcp-servers:detail.reconnect")
                     : t("mcp-servers:detail.connect")}
                 </Button>
+                {usesOAuth && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => connection.reauthorize({ fresh: true })}
+                    disabled={
+                      connection.connectionStatus === "connecting" ||
+                      resetErrorMutation.isPending
+                    }
+                    className="whitespace-nowrap flex-shrink-0"
+                  >
+                    {t("mcp-servers:detail.reauthenticate")}
+                  </Button>
+                )}
               </div>
             )}
           </div>
