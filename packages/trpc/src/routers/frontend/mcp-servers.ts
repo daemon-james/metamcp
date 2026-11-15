@@ -6,6 +6,8 @@ import {
   DeleteMcpServerResponseSchema,
   GetMcpServerResponseSchema,
   ListMcpServersResponseSchema,
+  ResetMcpServerErrorRequestSchema,
+  ResetMcpServerErrorResponseSchema,
   UpdateMcpServerRequestSchema,
   UpdateMcpServerResponseSchema,
 } from "@repo/zod-types";
@@ -41,6 +43,10 @@ export const createMcpServersRouter = (
       },
       userId: string,
     ) => Promise<z.infer<typeof DeleteMcpServerResponseSchema>>;
+    resetError: (
+      input: z.infer<typeof ResetMcpServerErrorRequestSchema>,
+      userId: string,
+    ) => Promise<z.infer<typeof ResetMcpServerErrorResponseSchema>>;
     update: (
       input: z.infer<typeof UpdateMcpServerRequestSchema>,
       userId: string,
@@ -85,6 +91,14 @@ export const createMcpServersRouter = (
       .output(DeleteMcpServerResponseSchema)
       .mutation(async ({ input, ctx }) => {
         return await implementations.delete(input, ctx.user.id);
+      }),
+
+    // Protected: clear a transient server error and establish a fresh pool connection
+    resetError: protectedProcedure
+      .input(ResetMcpServerErrorRequestSchema)
+      .output(ResetMcpServerErrorResponseSchema)
+      .mutation(async ({ input, ctx }) => {
+        return await implementations.resetError(input, ctx.user.id);
       }),
 
     // Protected: Update MCP server

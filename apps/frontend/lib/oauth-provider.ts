@@ -359,6 +359,53 @@ class DbOAuthClientProvider implements OAuthClientProvider {
     throw new Error("No code verifier saved for session");
   }
 
+  // SDK hook: auth() calls this on InvalidGrantError / InvalidClientError
+  // before retrying. Without it the retry still sees the dead tokens,
+  // refreshes them again, and loops — Connect appears to do nothing.
+  // Also used by the Authorize button so a rejected grant is dropped
+  // before startAuthorization runs.
+  async invalidateCredentials(
+    scope: "all" | "client" | "tokens" | "verifier" | "discovery",
+  ) {
+    this.ensureServerUrlStored();
+    if (scope === "discovery") return;
+
+    if (scope === "tokens" || scope === "all") {
+      sessionStorage.removeItem(
+        getServerSpecificKey(SESSION_KEYS.TOKENS, this.serverUrl),
+      );
+    }
+    if (scope === "client" || scope === "all") {
+      sessionStorage.removeItem(
+        getServerSpecificKey(SESSION_KEYS.CLIENT_INFORMATION, this.serverUrl),
+      );
+    }
+    if (scope === "verifier" || scope === "all") {
+      sessionStorage.removeItem(
+        getServerSpecificKey(SESSION_KEYS.CODE_VERIFIER, this.serverUrl),
+      );
+    }
+
+    if (await this.serverExists()) {
+      try {
+        const result =
+          await vanillaTrpcClient.frontend.oauth.invalidateCredentials.mutate({
+            mcp_server_uuid: this.mcpServerUuid,
+            scope,
+          });
+        if (!result.success) {
+          console.error(
+            "Server-side credential invalidation failed:",
+            result.error,
+            result.error_description,
+          );
+        }
+      } catch (error) {
+        console.error("Error invalidating OAuth credentials:", error);
+      }
+    }
+  }
+
   clear() {
     sessionStorage.removeItem(
       getServerSpecificKey(SESSION_KEYS.CLIENT_INFORMATION, this.serverUrl),

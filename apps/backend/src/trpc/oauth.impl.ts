@@ -7,6 +7,8 @@ import {
   ExchangeOAuthTokenResponseSchema,
   GetOAuthSessionRequestSchema,
   GetOAuthSessionResponseSchema,
+  InvalidateOAuthCredentialsRequestSchema,
+  InvalidateOAuthCredentialsResponseSchema,
   McpServerErrorStatusEnum,
   OAuthClientInformationSchema,
   RefreshOAuthTokenRequestSchema,
@@ -612,6 +614,40 @@ export const oauthImplementations = {
       return {
         success: false as const,
         error: "discovery_failed",
+        error_description:
+          error instanceof Error ? error.message : String(error),
+      };
+    }
+  },
+
+  // Drop stored tokens / client / verifier so Connect can start a new
+  // authorize redirect. Dead tokens make the SDK's auth() try a refresh
+  // that either CORS-fails in the browser or, on invalid_grant without
+  // invalidateCredentials, retries forever — the Connect button then
+  // appears to do nothing.
+  invalidateCredentials: async (
+    input: z.infer<typeof InvalidateOAuthCredentialsRequestSchema>,
+    userId: string,
+  ): Promise<z.infer<typeof InvalidateOAuthCredentialsResponseSchema>> => {
+    const serverResolution = await resolveOwnedServerUrl(
+      input.mcp_server_uuid,
+      userId,
+    );
+    if (!serverResolution.ok) {
+      return { success: false as const, ...serverResolution.error };
+    }
+
+    try {
+      await oauthSessionsRepository.clearCredentials(
+        input.mcp_server_uuid,
+        input.scope,
+      );
+      return { success: true as const };
+    } catch (error) {
+      logger.error("Error invalidating OAuth credentials:", error);
+      return {
+        success: false as const,
+        error: "invalidate_failed",
         error_description:
           error instanceof Error ? error.message : String(error),
       };

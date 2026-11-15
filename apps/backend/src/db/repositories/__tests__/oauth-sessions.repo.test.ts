@@ -7,6 +7,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const valuesCalls: any[] = [];
 const onConflictSetCalls: any[] = [];
 const onConflictTargetCalls: any[] = [];
+const updateSetCalls: any[] = [];
 
 // In-memory store keyed by mcp_server_uuid that mimics
 // `INSERT ... ON CONFLICT (mcp_server_uuid) DO UPDATE SET ...` semantics.
@@ -65,6 +66,28 @@ vi.mock("../../index", () => {
                 },
               };
             },
+          };
+        },
+      }),
+      update: () => ({
+        set: (set: any) => {
+          updateSetCalls.push(set);
+          return {
+            where: () => ({
+              returning: async () => {
+                const key = [...store.keys()][0];
+                if (!key) return [];
+                const existing = store.get(key);
+                const { updated_at: _ignored, ...applicable } = set;
+                const updated = {
+                  ...existing,
+                  ...applicable,
+                  updated_at: new Date(),
+                };
+                store.set(key, updated);
+                return [updated];
+              },
+            }),
           };
         },
       }),
@@ -198,5 +221,42 @@ describe("OAuthSessionsRepository.upsert", () => {
       access_token: "tok",
       token_type: "Bearer",
     });
+  });
+});
+
+describe("OAuthSessionsRepository.clearCredentials", () => {
+  const repo = new OAuthSessionsRepository();
+  const serverId = "00000000-0000-0000-0000-000000000001";
+
+  beforeEach(async () => {
+    store.clear();
+    updateSetCalls.length = 0;
+    await repo.upsert({
+      mcp_server_uuid: serverId,
+      client_information: { client_id: "client-A" } as OAuthClientInformation,
+      tokens: { access_token: "dead", token_type: "Bearer" } as OAuthTokens,
+      code_verifier: "pkce",
+    });
+  });
+
+  it("nulls tokens and tokens_issued_at without touching client_information", async () => {
+    const cleared = await repo.clearCredentials(serverId, "tokens");
+
+    expect(cleared?.tokens).toBeNull();
+    expect(cleared?.client_information).toEqual({ client_id: "client-A" });
+    expect(cleared?.code_verifier).toBe("pkce");
+
+    const set = updateSetCalls[0];
+    expect(set).toMatchObject({ tokens: null, tokens_issued_at: null });
+    expect(set).not.toHaveProperty("client_information");
+    expect(set).not.toHaveProperty("code_verifier");
+  });
+
+  it("clears tokens, client, and verifier together for scope all", async () => {
+    const cleared = await repo.clearCredentials(serverId, "all");
+
+    expect(cleared?.tokens).toBeNull();
+    expect(cleared?.client_information).toEqual({});
+    expect(cleared?.code_verifier).toBeNull();
   });
 });

@@ -1,6 +1,10 @@
 "use client";
 
-import { McpServer, McpServerTypeEnum } from "@repo/zod-types";
+import {
+  McpServer,
+  McpServerErrorStatusEnum,
+  McpServerTypeEnum,
+} from "@repo/zod-types";
 import { useMemoizedFn } from "ahooks";
 import { ChevronDown, Edit, Eye, SearchCode, Server } from "lucide-react";
 import { useRouter, useSearchParams } from "next/navigation";
@@ -111,11 +115,16 @@ function McpInspectorContent() {
       if (connection.connectionStatus === "connected") {
         // If we're connected but to a different server, disconnect first
         connection.disconnect().then(() => {
-          connection.connect();
+          connection.connect(undefined, 0, { startOAuth: false });
         });
       } else if (connection.connectionStatus === "disconnected") {
-        // Auto-connect when server is selected and not already connected
-        connection.connect();
+        // Opening inspector must not start OAuth. Connect does that.
+        if (
+          selectedServer.error_status !==
+          McpServerErrorStatusEnum.enum.UNAUTHORIZED
+        ) {
+          connection.connect(undefined, 0, { startOAuth: false });
+        }
       }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -132,6 +141,11 @@ function McpInspectorContent() {
       connection.disconnect().then(() => {
         connection.connect();
       });
+    } else if (
+      selectedServer?.error_status ===
+      McpServerErrorStatusEnum.enum.UNAUTHORIZED
+    ) {
+      connection.reauthorize();
     } else {
       connection.connect();
     }

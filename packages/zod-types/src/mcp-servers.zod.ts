@@ -594,6 +594,16 @@ export const DeleteMcpServerResponseSchema = z.object({
   error: z.string().optional(),
 });
 
+export const ResetMcpServerErrorRequestSchema = z.object({
+  uuid: z.string().uuid(),
+});
+
+export const ResetMcpServerErrorResponseSchema = z.object({
+  success: z.boolean(),
+  message: z.string().optional(),
+  error: z.string().optional(),
+});
+
 export const UpdateMcpServerRequestSchema = z
   .object({
     uuid: z.string().uuid(),
@@ -658,6 +668,14 @@ export type DeleteMcpServerRequest = z.infer<
 
 export type DeleteMcpServerResponse = z.infer<
   typeof DeleteMcpServerResponseSchema
+>;
+
+export type ResetMcpServerErrorRequest = z.infer<
+  typeof ResetMcpServerErrorRequestSchema
+>;
+
+export type ResetMcpServerErrorResponse = z.infer<
+  typeof ResetMcpServerErrorResponseSchema
 >;
 
 export type UpdateMcpServerRequest = z.infer<

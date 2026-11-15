@@ -24,11 +24,9 @@ import {
   Progress,
   PromptListChangedNotificationSchema,
   PromptReference,
-  Request,
   ResourceListChangedNotificationSchema,
   ResourceReference,
   ResourceUpdatedNotificationSchema,
-  Result,
   ServerCapabilities,
   ToolListChangedNotificationSchema,
 } from "@modelcontextprotocol/sdk/types.js";
@@ -311,27 +309,41 @@ export function useConnection({
     );
   });
 
-  const handleAuthError = useMemoizedFn(async (error: unknown) => {
-    if (is401Error(error)) {
+  const handleAuthError = useMemoizedFn(
+    async (error: unknown, startOAuth: boolean) => {
+      if (!is401Error(error) || !startOAuth) {
+        return false;
+      }
       sessionStorage.setItem(SESSION_KEYS.SERVER_URL, url || "");
       sessionStorage.setItem(SESSION_KEYS.MCP_SERVER_UUID, mcpServerUuid);
 
+      // Drop the rejected grant before auth() runs. Leaving it in place
+      // makes auth() try a browser-side refresh; on invalid_grant the SDK
+      // retries after invalidateCredentials, and without that method the
+      // retry still sees the same tokens and loops. Connect then does nothing.
+      await authProvider.invalidateCredentials("tokens");
       const result = await auth(authProvider, {
         serverUrl: url || "",
       });
       return result === "AUTHORIZED";
-    }
-    return false;
-  });
+    },
+  );
 
   const connect = useMemoizedFn(
-    async (_e?: unknown, retryCount: number = 0): Promise<void> => {
+    async (
+      _e?: unknown,
+      retryCount: number = 0,
+      options: { startOAuth?: boolean } = {},
+    ): Promise<void> => {
+      const startOAuth = options.startOAuth ?? true;
       // Skip connection if hook is disabled
       if (!enabled) {
         console.warn("Cannot connect: useConnection hook is disabled");
         setConnectionStatus("disconnected");
         return;
       }
+
+      setConnectionStatus("connecting");
 
       // For MetaMCP connections, we don't need server data
       if (!isMetaMCP) {
@@ -611,13 +623,16 @@ export function useConnection({
             return;
           }
 
-          const shouldRetry = await handleAuthError(error);
+          const shouldRetry = await handleAuthError(error, startOAuth);
           if (shouldRetry) {
-            return connect(undefined, retryCount + 1);
+            return connect(undefined, retryCount + 1, { startOAuth });
           }
           if (is401Error(error)) {
-            // Don't set error state if we're about to redirect for auth
-
+            if (startOAuth) {
+              // Redirect is in progress. Stay off the error state.
+              return;
+            }
+            setConnectionStatus("error");
             return;
           }
           throw error;
@@ -647,6 +662,40 @@ export function useConnection({
       }
     },
   );
+
+  // Connect click when the stored grant is dead. Page load must not
+  // call this. Retrying the proxy with those tokens cannot succeed, so
+  // skip that hop and send the user to the upstream login.
+  const reauthorize = useMemoizedFn(async (): Promise<void> => {
+    if (!enabled) {
+      console.warn("Cannot reauthorize: useConnection hook is disabled");
+      setConnectionStatus("disconnected");
+      return;
+    }
+
+    setConnectionStatus("connecting");
+    sessionStorage.setItem(SESSION_KEYS.SERVER_URL, url || "");
+    sessionStorage.setItem(SESSION_KEYS.MCP_SERVER_UUID, mcpServerUuid);
+
+    try {
+      await authProvider.invalidateCredentials("tokens");
+      const result = await auth(authProvider, {
+        serverUrl: url || "",
+      });
+      if (result === "AUTHORIZED") {
+        return connect();
+      }
+      // REDIRECT: navigation is in progress.
+    } catch (error) {
+      console.error("Failed to start OAuth re-authorization:", error);
+      toast.error(
+        error instanceof Error
+          ? error.message
+          : "Failed to start authorization",
+      );
+      setConnectionStatus("error");
+    }
+  });
 
   const disconnect = useMemoizedFn(async () => {
     try {
@@ -724,6 +773,7 @@ export function useConnection({
     handleCompletion,
     completionsSupported,
     connect,
+    reauthorize,
     disconnect,
   };
 }

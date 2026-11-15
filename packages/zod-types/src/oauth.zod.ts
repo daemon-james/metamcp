@@ -312,6 +312,30 @@ export const DiscoverOAuthResponseSchema = z.union([
   }),
 ]);
 
+// Drop stored credentials so `auth()` starts a new authorize redirect
+// instead of refreshing a grant the upstream already rejected.
+//
+// The SDK calls `OAuthClientProvider.invalidateCredentials(scope)` on
+// `invalid_grant` / `invalid_client`. Upsert cannot write NULL (truthy
+// spread), so this is the dedicated clear path — same reason
+// `clearExpectedState` exists. `discovery` is frontend-only (nothing
+// persisted) and is not accepted here.
+export const InvalidateOAuthCredentialsRequestSchema = z.object({
+  mcp_server_uuid: z.string().uuid(),
+  scope: z.enum(["tokens", "client", "verifier", "all"]),
+});
+
+export const InvalidateOAuthCredentialsResponseSchema = z.union([
+  z.object({
+    success: z.literal(true),
+  }),
+  z.object({
+    success: z.literal(false),
+    error: z.string(),
+    error_description: z.string().optional(),
+  }),
+]);
+
 // Repository-specific schemas.
 //
 // `tokens` is typed against UpstreamTokenResponseSchema (RFC 6749 +

@@ -13,6 +13,7 @@ vi.mock("../db/repositories", () => ({
     findByMcpServerUuid: vi.fn(),
     upsert: vi.fn(),
     clearExpectedState: vi.fn(),
+    clearCredentials: vi.fn(),
   },
   mcpServersRepository: {
     findByUuid: vi.fn(),
@@ -990,5 +991,96 @@ describe("oauthImplementations.discover", () => {
     expect(result.success).toBe(false);
     if (!result.success) expect(result.error).toBe("discovery_failed");
     fetchSpy.mockRestore();
+  });
+});
+
+describe("oauthImplementations.invalidateCredentials", () => {
+  beforeEach(() => {
+    process.env.APP_URL = "https://metamcp.example.com";
+    vi.clearAllMocks();
+  });
+  afterEach(() => {
+    process.env.APP_URL = ORIGINAL_APP_URL;
+  });
+
+  const loadModule = async () => {
+    const repos = await import("../db/repositories");
+    const impl = await import("./oauth.impl");
+    return {
+      oauthImplementations: impl.oauthImplementations,
+      findServerByUuid: repos.mcpServersRepository.findByUuid as ReturnType<
+        typeof vi.fn
+      >,
+      clearCredentials: repos.oauthSessionsRepository
+        .clearCredentials as ReturnType<typeof vi.fn>,
+    };
+  };
+
+  const ownedServer = (uuid: string, url: string, userId = "user-1") => ({
+    uuid,
+    name: "test-server",
+    type: "STREAMABLE_HTTP" as const,
+    url,
+    user_id: userId,
+    description: null,
+    command: null,
+    args: [] as string[],
+    env: {},
+    error_status: "UNAUTHORIZED" as const,
+    created_at: new Date(),
+    bearerToken: null,
+    headers: {},
+  });
+
+  const USER_ID = "user-1";
+  const SERVER_UUID = "00000000-0000-0000-0000-000000000abc";
+
+  it("clears stored tokens for an owned server", async () => {
+    const { oauthImplementations, findServerByUuid, clearCredentials } =
+      await loadModule();
+    findServerByUuid.mockResolvedValue(
+      ownedServer(SERVER_UUID, "https://mcp.stripe.com"),
+    );
+    clearCredentials.mockResolvedValue({ mcp_server_uuid: SERVER_UUID });
+
+    const result = await oauthImplementations.invalidateCredentials(
+      { mcp_server_uuid: SERVER_UUID, scope: "tokens" },
+      USER_ID,
+    );
+
+    expect(result).toEqual({ success: true });
+    expect(clearCredentials).toHaveBeenCalledWith(SERVER_UUID, "tokens");
+  });
+
+  it("returns access_denied when a different user owns the server", async () => {
+    const { oauthImplementations, findServerByUuid, clearCredentials } =
+      await loadModule();
+    findServerByUuid.mockResolvedValue(
+      ownedServer(SERVER_UUID, "https://mcp.stripe.com", "other-user"),
+    );
+
+    const result = await oauthImplementations.invalidateCredentials(
+      { mcp_server_uuid: SERVER_UUID, scope: "tokens" },
+      USER_ID,
+    );
+
+    expect(result.success).toBe(false);
+    if (!result.success) expect(result.error).toBe("access_denied");
+    expect(clearCredentials).not.toHaveBeenCalled();
+  });
+
+  it("returns server_not_found when the MCP server does not exist", async () => {
+    const { oauthImplementations, findServerByUuid, clearCredentials } =
+      await loadModule();
+    findServerByUuid.mockResolvedValue(undefined);
+
+    const result = await oauthImplementations.invalidateCredentials(
+      { mcp_server_uuid: SERVER_UUID, scope: "all" },
+      USER_ID,
+    );
+
+    expect(result.success).toBe(false);
+    if (!result.success) expect(result.error).toBe("server_not_found");
+    expect(clearCredentials).not.toHaveBeenCalled();
   });
 });

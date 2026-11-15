@@ -136,11 +136,15 @@ export default function McpServerDetailPage({
     },
   });
 
+  const resetErrorMutation = trpc.frontend.mcpServers.resetError.useMutation();
+
   const server: McpServer | undefined = serverResponse?.success
     ? serverResponse.data
     : undefined;
 
-  // MCP Connection setup - only enable when server data is loaded and not in error state
+
+  // Keep the connection hook enabled in ERROR state so the Connect button can
+  // recover the backend state and immediately establish a fresh connection.
   const connection = useConnection({
     mcpServerUuid: uuid,
     transportType: server?.type || McpServerTypeEnum.enum.STDIO,
@@ -155,11 +159,7 @@ export default function McpServerDetailPage({
     onStdErrNotification: (notification) => {
       console.error("MCP StdErr:", notification);
     },
-    enabled: Boolean(
-      server &&
-      !isLoading &&
-      server.error_status !== McpServerErrorStatusEnum.enum.ERROR,
-    ),
+    enabled: Boolean(server && !isLoading),
   });
 
   // Auto-connect when hook is enabled and not already connected.
@@ -167,6 +167,9 @@ export default function McpServerDetailPage({
   // effects in dev: without the ref, both fires would race two concurrent
   // OAuth dynamic registrations and the browser/DB would disagree on
   // client_id, breaking token exchange.
+  //
+  // Skip UNAUTHORIZED so opening the page does not start OAuth.
+  // Connect is the only path that starts a new login.
   const didAutoConnect = useRef(false);
   useEffect(() => {
     if (didAutoConnect.current) return;
@@ -175,10 +178,11 @@ export default function McpServerDetailPage({
       server &&
       !isLoading &&
       server.error_status !== McpServerErrorStatusEnum.enum.ERROR &&
+      server.error_status !== McpServerErrorStatusEnum.enum.UNAUTHORIZED &&
       connection.connectionStatus === "disconnected"
     ) {
       didAutoConnect.current = true;
-      connection.connect();
+      connection.connect(undefined, 0, { startOAuth: false });
     }
   }, [server, connection, isLoading]);
 
@@ -195,13 +199,32 @@ export default function McpServerDetailPage({
   };
 
   // Handle manual connect/disconnect
-  const handleConnectionToggle = () => {
+  const handleConnectionToggle = async () => {
     if (server?.error_status === McpServerErrorStatusEnum.enum.ERROR) {
-      // Don't allow connection if server is in error state
+      try {
+        const result = await resetErrorMutation.mutateAsync({ uuid });
+        if (!result.success) {
+          toast.error(result.message || "Failed to reconnect MCP server");
+          return;
+        }
+
+        await refetch();
+        await connection.connect();
+      } catch (error) {
+        toast.error(
+          error instanceof Error
+            ? error.message
+            : "Failed to reconnect MCP server",
+        );
+      }
       return;
     }
     if (connection.connectionStatus === "connected") {
       connection.disconnect();
+    } else if (
+      server?.error_status === McpServerErrorStatusEnum.enum.UNAUTHORIZED
+    ) {
+      connection.reauthorize();
     } else {
       connection.connect();
     }
@@ -214,6 +237,24 @@ export default function McpServerDetailPage({
       return {
         text: t("mcp-servers:detail.serverError"),
         color: "text-destructive",
+        icon: Server,
+      };
+    }
+
+    if (
+      server?.error_status === McpServerErrorStatusEnum.enum.UNAUTHORIZED &&
+      connection.connectionStatus !== "connected"
+    ) {
+      if (connection.connectionStatus === "connecting") {
+        return {
+          text: t("mcp-servers:detail.connecting"),
+          color: "text-yellow-600 dark:text-yellow-400",
+          icon: Plug,
+        };
+      }
+      return {
+        text: t("mcp-servers:detail.unauthorized"),
+        color: "text-yellow-600 dark:text-yellow-400",
         icon: Server,
       };
     }
@@ -455,7 +496,10 @@ export default function McpServerDetailPage({
                   variant="outline"
                   size="sm"
                   onClick={handleConnectionToggle}
-                  disabled={connection.connectionStatus === "connecting"}
+                  disabled={
+                    connection.connectionStatus === "connecting" ||
+                    resetErrorMutation.isPending
+                  }
                   className="whitespace-nowrap flex-shrink-0"
                 >
                   {connection.connectionStatus === "connected"

@@ -7,6 +7,8 @@ import {
   GetMcpServerResponseSchema,
   ListMcpServersResponseSchema,
   McpServerTypeEnum,
+  ResetMcpServerErrorRequestSchema,
+  ResetMcpServerErrorResponseSchema,
   UpdateMcpServerRequestSchema,
   UpdateMcpServerResponseSchema,
 } from "@repo/zod-types";
@@ -357,6 +359,72 @@ export const mcpServersImplementations = {
       };
     } catch (error) {
       logger.error("Error deleting MCP server:", error);
+      return {
+        success: false as const,
+        message:
+          error instanceof Error ? error.message : "Internal server error",
+      };
+    }
+  },
+
+  resetError: async (
+    input: z.infer<typeof ResetMcpServerErrorRequestSchema>,
+    userId: string,
+  ): Promise<z.infer<typeof ResetMcpServerErrorResponseSchema>> => {
+    try {
+      const server = await mcpServersRepository.findByUuid(input.uuid);
+
+      if (!server) {
+        return {
+          success: false as const,
+          message: "MCP server not found",
+        };
+      }
+
+      if (server.user_id && server.user_id !== userId) {
+        return {
+          success: false as const,
+          message: "Access denied: You can only reconnect servers you own",
+        };
+      }
+
+      await serverErrorTracker.resetServerErrorState(server.uuid);
+
+      const serverParams = await convertDbServerToParams(server);
+      if (!serverParams) {
+        return {
+          success: false as const,
+          message: "MCP server configuration is invalid",
+        };
+      }
+
+      // Destroy any stale-but-still-pingable idle transport. That transport can
+      // otherwise keep ERROR latched forever because the periodic recovery loop
+      // only re-dials servers that have no idle session.
+      await mcpServerPool.invalidateIdleSession(server.uuid, serverParams);
+
+      const affectedNamespaceUuids =
+        await namespaceMappingsRepository.findNamespacesByServerUuid(
+          server.uuid,
+        );
+
+      if (affectedNamespaceUuids.length > 0) {
+        await metaMcpServerPool.invalidateIdleServers(affectedNamespaceUuids);
+        affectedNamespaceUuids.forEach((namespaceUuid) => {
+          clearOverrideCache(namespaceUuid);
+        });
+      }
+
+      logger.info(
+        `Reset error and reconnected MCP server: ${server.name} (${server.uuid})`,
+      );
+
+      return {
+        success: true as const,
+        message: "MCP server reconnected successfully",
+      };
+    } catch (error) {
+      logger.error(`Error reconnecting MCP server ${input.uuid}:`, error);
       return {
         success: false as const,
         message:

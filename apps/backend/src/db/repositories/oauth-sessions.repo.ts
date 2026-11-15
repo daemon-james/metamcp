@@ -1,3 +1,4 @@
+import { OAuthClientInformation } from "@modelcontextprotocol/sdk/shared/auth.js";
 import {
   DatabaseOAuthSession,
   OAuthSessionCreateInput,
@@ -60,6 +61,41 @@ export class OAuthSessionsRepository {
         updated_at: sql`NOW()`,
       })
       .where(eq(oauthSessionsTable.mcp_server_uuid, input.mcp_server_uuid))
+      .returning();
+
+    return updatedSession;
+  }
+
+  // Dedicated clear path for stored credentials. The truthy-spread upsert
+  // cannot write NULL (a `null` value is elided by the `&&` guard), so
+  // dropping a rejected grant — the step that lets Connect start a new
+  // authorize redirect — goes through this method. Returns the updated
+  // row, or undefined if no row exists for the server.
+  //
+  // `client_information` is NOT NULL with a `{}` default, so 'client'
+  // writes the empty object rather than NULL.
+  async clearCredentials(
+    mcpServerUuid: string,
+    scope: "tokens" | "client" | "verifier" | "all",
+  ): Promise<DatabaseOAuthSession | undefined> {
+    const [updatedSession] = await db
+      .update(oauthSessionsTable)
+      .set({
+        ...((scope === "tokens" || scope === "all") && {
+          tokens: null,
+          tokens_issued_at: null,
+        }),
+        ...((scope === "client" || scope === "all") && {
+          // Column is NOT NULL with a `{}` default. The SDK type wants
+          // client_id; an empty object is the registered-cleared state.
+          client_information: {} as OAuthClientInformation,
+        }),
+        ...((scope === "verifier" || scope === "all") && {
+          code_verifier: null,
+        }),
+        updated_at: sql`NOW()`,
+      })
+      .where(eq(oauthSessionsTable.mcp_server_uuid, mcpServerUuid))
       .returning();
 
     return updatedSession;

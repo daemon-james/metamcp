@@ -5,6 +5,8 @@ import {
   ExchangeOAuthTokenResponseSchema,
   GetOAuthSessionRequestSchema,
   GetOAuthSessionResponseSchema,
+  InvalidateOAuthCredentialsRequestSchema,
+  InvalidateOAuthCredentialsResponseSchema,
   RefreshOAuthTokenRequestSchema,
   RegisterOAuthClientRequestSchema,
   RegisterOAuthClientResponseSchema,
@@ -43,6 +45,10 @@ export const createOAuthRouter = (
       input: z.infer<typeof DiscoverOAuthRequestSchema>,
       userId: string,
     ) => Promise<z.infer<typeof DiscoverOAuthResponseSchema>>;
+    invalidateCredentials: (
+      input: z.infer<typeof InvalidateOAuthCredentialsRequestSchema>,
+      userId: string,
+    ) => Promise<z.infer<typeof InvalidateOAuthCredentialsResponseSchema>>;
   },
 ) => {
   return router({
@@ -106,6 +112,16 @@ export const createOAuthRouter = (
       .output(DiscoverOAuthResponseSchema)
       .query(async ({ input, ctx }) => {
         return await implementations.discover(input, ctx.user.id);
+      }),
+
+    // Protected: drop stored tokens / client / verifier so Connect can
+    // start a new authorize redirect. Same ownership/SSRF rule as
+    // register — the referenced server must be owned by the caller.
+    invalidateCredentials: protectedProcedure
+      .input(InvalidateOAuthCredentialsRequestSchema)
+      .output(InvalidateOAuthCredentialsResponseSchema)
+      .mutation(async ({ input, ctx }) => {
+        return await implementations.invalidateCredentials(input, ctx.user.id);
       }),
   });
 };
