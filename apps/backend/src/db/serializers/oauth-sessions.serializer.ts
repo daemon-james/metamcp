@@ -28,7 +28,13 @@ export class OAuthSessionsSerializer {
     return {
       uuid: dbSession.uuid,
       mcp_server_uuid: dbSession.mcp_server_uuid,
-      client_information: dbSession.client_information,
+      // Clearing a registration writes `{}` (the column is NOT NULL).
+      // Report that as no registration: `{}` fails the response schema's
+      // required client_id, and the 500 made the page skip server-side
+      // registration and call the provider from the browser instead.
+      client_information: dbSession.client_information?.client_id
+        ? dbSession.client_information
+        : null,
       tokens: dbSession.tokens,
       code_verifier: dbSession.code_verifier,
       created_at: dbSession.created_at.toISOString(),
