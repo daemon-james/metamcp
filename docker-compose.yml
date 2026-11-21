@@ -20,6 +20,13 @@ services:
       - .env
     ports:
       - "12008:12008"
+      # The backend, published so Traefik can route MCP traffic
+      # (/metamcp/*) straight to it. Through the Next.js frontend on 12008
+      # the server-to-client stream never opens (the rewrite proxy holds the
+      # SSE response and drops it at proxyTimeout), so clients never receive
+      # notifications/tools/list_changed. See
+      # /etc/dokploy/traefik/dynamic/metamcp.yml.
+      - "12009:12009"
     environment:
       # Postgres connection details
       POSTGRES_HOST: ${POSTGRES_HOST:-postgres}
